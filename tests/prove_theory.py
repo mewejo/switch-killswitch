@@ -35,7 +35,7 @@ from pysnmp.entity.rfc3413 import cmdrsp, context
 from pysnmp.proto.rfc1902 import Integer, TimeTicks
 
 from app.actor import PortShutdownActor
-from app.config import load_config
+from app.config import load_config, load_config_from_env
 from app.notify import Notifier
 from app.poller import LinkPoller
 
@@ -351,6 +351,31 @@ async def main() -> int:
         "invisible flap triggers admin-down",
         int(port.admin.syntax) == 2 and counter.actions == 2,
         f"(ifAdminStatus.24={int(port.admin.syntax)}, actions={counter.actions})",
+    )
+
+    # --- Scenario E: file-less config, entirely from environment variables ---
+    log.info("=== scenario E: env-only configuration mode ===")
+    os.environ.update({
+        "SWITCHES": "sw-a@192.0.2.10:24,25;192.0.2.20:3",
+        "SNMP_AUTH_PASSWORD": AUTH_PASS,
+        "SNMP_PRIV_PASSWORD": PRIV_PASS,
+        "KILL_DELAY": "2.5",
+        "SMTP_TO": "a@test.local, b@test.local",
+    })
+    env_cfg = load_config_from_env()
+    sw_a, sw_b = env_cfg.switches.get("192.0.2.10"), env_cfg.switches.get("192.0.2.20")
+    check(
+        "env-only config mode works",
+        sw_a is not None and sw_a.name == "sw-a"
+        and sw_a.allowed_ifindexes == frozenset({24, 25})
+        and sw_b is not None and sw_b.name == "192.0.2.20"
+        and sw_b.allowed_ifindexes == frozenset({3})
+        and env_cfg.snmp.auth_password == AUTH_PASS
+        and env_cfg.standby_delay == 2.5
+        and env_cfg.notifications.email is not None
+        and env_cfg.notifications.email.recipients == ("a@test.local", "b@test.local")
+        and env_cfg.notifications.home_assistant is None,
+        f"(switches={list(env_cfg.switches)})",
     )
 
     failed = [n for n, ok in CHECKS if not ok]

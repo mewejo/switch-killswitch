@@ -8,7 +8,7 @@ import logging
 import sys
 
 from .actor import PortShutdownActor
-from .config import ConfigError, load_config
+from .config import ConfigError, load_config, load_config_from_env
 from .notify import Notifier
 from .poller import LinkPoller
 
@@ -21,8 +21,11 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-async def run(config_path: str) -> None:
-    cfg = load_config(config_path)
+async def run(config_path: str | None) -> None:
+    cfg = load_config(config_path) if config_path else load_config_from_env()
+    logging.getLogger("killswitch").info(
+        "configuration source: %s", config_path or "environment variables"
+    )
     notifier = Notifier(cfg)
     actor = PortShutdownActor(cfg, notifier)
     poller = LinkPoller(cfg, actor)
@@ -43,7 +46,7 @@ async def run(config_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SNMP switch port killswitch")
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", help="YAML config file; omit to configure entirely from env")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     setup_logging(args.verbose)

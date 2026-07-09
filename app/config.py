@@ -173,13 +173,91 @@ def _load_home_assistant(raw: dict) -> HomeAssistantConfig | None:
     )
 
 
+def _parse_ifindexes(value) -> list[int]:
+    """Accept a YAML list or a comma-separated string (env form)."""
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(";", ",").split(",")]
+        value = [p for p in parts if p]
+    try:
+        return [int(v) for v in value or []]
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(f"bad allowed_ifindexes {value!r}") from exc
+
+
+_SWITCH_SPEC = re.compile(r"(?:(?P<name>[^@\s;]+)@)?(?P<ip>[0-9a-fA-F:.]+):(?P<ports>[0-9,]+)")
+
+
+def load_config_from_env() -> Config:
+    """Build the whole config from environment variables (no files needed).
+
+    SWITCHES is a compact spec: `name@ip:if1,if2` entries separated by
+    whitespace or `;`, e.g. `SWITCHES="core@192.0.2.10:24,25;lab@192.0.2.20:3"`.
+    """
+    env = os.environ
+    switches = []
+    spec = env.get("SWITCHES", "").strip()
+    if not spec:
+        raise ConfigError("SWITCHES is required in env-config mode (name@ip:if1,if2 ...)")
+    for entry in re.split(r"[;\s]+", spec):
+        if not entry:
+            continue
+        match = _SWITCH_SPEC.fullmatch(entry)
+        if not match:
+            raise ConfigError(f"bad SWITCHES entry {entry!r} (want name@ip:if1,if2)")
+        switches.append({
+            "name": match["name"] or match["ip"],
+            "ip": match["ip"],
+            "allowed_ifindexes": match["ports"],
+            "debounce_seconds": env.get("DEBOUNCE_SECONDS", 10),
+            "snmp_port": env.get("SNMP_PORT", 161),
+        })
+    raw = {
+        "snmp": {
+            "user": env.get("SNMP_USER", "portshut-user"),
+            "auth_protocol": env.get("SNMP_AUTH_PROTOCOL", "SHA"),
+            "auth_password_env": "SNMP_AUTH_PASSWORD",
+            "priv_protocol": env.get("SNMP_PRIV_PROTOCOL", "DES"),
+            "priv_password_env": "SNMP_PRIV_PASSWORD",
+        },
+        "poll": {"interval_seconds": env.get("POLL_INTERVAL", 0.5)},
+        "redundancy": {"standby_delay_seconds": env.get("KILL_DELAY", 0)},
+        "rate_limit": {
+            "max_actions": env.get("RATE_MAX_ACTIONS", 10),
+            "per_seconds": env.get("RATE_PER_SECONDS", 60),
+        },
+        "notifications": {
+            "email": {
+                "enabled": env.get("EMAIL_ENABLED", "true"),
+                "smtp_host": env.get("SMTP_HOST", "localhost"),
+                "smtp_port": env.get("SMTP_PORT", 25),
+                "security": env.get("SMTP_SECURITY", "none"),
+                "username": env.get("SMTP_USERNAME", ""),
+                "password_env": "SMTP_PASSWORD",
+                "from": env.get("SMTP_FROM", "killswitch@localhost"),
+                "to": [a.strip() for a in env.get("SMTP_TO", "alerts@example.com").split(",")],
+                "subject_prefix": env.get("SMTP_SUBJECT_PREFIX", "[killswitch]"),
+            },
+            "home_assistant": {
+                "enabled": env.get("HA_ENABLED", "false"),
+                "base_url": env.get("HA_BASE_URL", "http://homeassistant.local:8123"),
+                "token_env": "HA_TOKEN",
+                "event_type": env.get("HA_EVENT_TYPE", "switch_killswitch"),
+            },
+        },
+        "switches": switches,
+    }
+    return _build_config(raw)
+
+
 def load_config(path: str) -> Config:
     with open(path, encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
-    raw = _expand_env(raw)
+    return _build_config(_expand_env(raw))
 
+
+def _build_config(raw: dict) -> Config:
     snmp = raw.get("snmp") or {}
 
     auth_protocol = str(snmp.get("auth_protocol", "SHA")).upper()
@@ -206,8 +284,8 @@ def load_config(path: str) -> Config:
             ipaddress.ip_address(ip)
         except ValueError as exc:
             raise ConfigError(f"switch {entry.get('name')!r}: bad ip {ip!r}") from exc
-        ifindexes = entry.get("allowed_ifindexes") or []
-        if not all(isinstance(i, int) and i > 0 for i in ifindexes):
+        ifindexes = _parse_ifindexes(entry.get("allowed_ifindexes"))
+        if not all(i > 0 for i in ifindexes):
             raise ConfigError(f"switch {ip}: allowed_ifindexes must be positive integers")
         if not ifindexes:
             raise ConfigError(f"switch {ip}: allowed_ifindexes is empty; refusing ambiguous config")

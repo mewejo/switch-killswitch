@@ -14,6 +14,7 @@ USER killswitch
 # overrides `user:` to match the owner of the bind-mounted secrets)
 ENV HOME=/tmp
 
-# config/ and secrets/ are provided at runtime as read-only mounts
+# Configured entirely from environment variables by default (see .env.example);
+# pass `--config <path>` with a mounted file to use YAML instead.
 ENTRYPOINT ["python", "-m", "app.main"]
-CMD ["--config", "config/config.yaml"]
+CMD []

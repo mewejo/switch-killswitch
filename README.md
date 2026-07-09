@@ -23,29 +23,30 @@ FASTPATH — extra notes for that family in `docs/fastpath-notes.md`).
 - **Never un-kill** — re-enabling is manual, on the switch. A port that is
   already down when the service starts is baseline, never retro-killed.
 
-## Setup
+## Configuration
+
+Entirely via **environment variables** — the service needs no files or
+persistent storage. Copy `.env.example` to `.env` and fill in the three
+required values:
 
 ```
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp config/config.example.yaml config/config.yaml   # then edit for your network
-mkdir -p secrets && umask 077
-openssl rand -hex 12 > secrets/snmp_auth
-openssl rand -hex 12 > secrets/snmp_priv
+SWITCHES=core@192.0.2.10:24        # name@ip:ifIndex[,ifIndex] entries, ;-separated
+SNMP_AUTH_PASSWORD=...
+SNMP_PRIV_PASSWORD=...
 ```
 
-Create a dedicated SNMPv3 user on the switch with those credentials (write
-access to ifAdminStatus; the narrower the view the better) and put the
-switch IP + allowlisted ifIndexes in `config/config.yaml`. Verify the
-ifIndex mapping with an ifDescr walk before trusting it.
+Everything else (SNMP protocols, poll interval, debounce, rate limit,
+notifications, redundancy delay) has sensible defaults — see `.env.example`
+for the full reference. Create a dedicated SNMPv3 user on the switch with
+those credentials (write access to ifAdminStatus; the narrower the view the
+better), and verify the ifIndex mapping with an ifDescr walk before
+trusting it.
+
+A YAML file (`config/config.example.yaml`) is also supported for local
+development: pass `--config <path>`; its values support `${VAR:-default}`
+env expansion.
 
 ## Run
-
-```
-.venv/bin/python -m app.main --config config/config.yaml
-```
-
-No privileged ports, no root: the service only makes outbound SNMP requests.
 
 ### Docker
 
@@ -53,12 +54,27 @@ No privileged ports, no root: the service only makes outbound SNMP requests.
 docker compose up -d
 ```
 
-Uses host networking (needs to reach the switch's management IP; the default
-SMTP target `localhost:25` means the relay on the docker host) and mounts
-`./config` and `./secrets` read-only. `PUID` (default 1000) must match the
-owner of `secrets/`. Run it on a host attached to the switch's management
+No volumes, no mounts — config is the environment (`env_file: .env`). Uses
+host networking (must reach the switch's management IP; the default SMTP
+target `localhost:25` means the relay on the docker host). No inbound ports
+are ever opened. Run it on a host attached to the switch's management
 network. The image is built and published by GitHub Actions on every push
-to main.
+to main. Or without compose:
+
+```
+docker run -d --restart unless-stopped --network host --env-file .env \
+  ghcr.io/mewejo/switch-killswitch:latest
+```
+
+### Bare Python
+
+```
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+set -a; source .env; set +a
+.venv/bin/python -m app.main
+```
+
+No privileged ports, no root: the service only makes outbound SNMP requests.
 
 ## Redundancy
 
@@ -76,23 +92,9 @@ Events: `port_killed` (confirmed), `kill_failed` (SET rejected or read-back
 mismatch), `rate_limited` (storm guard refused an action). Notification
 failures are logged and never block the kill path.
 
-Config values support `${VAR}` / `${VAR:-default}` environment expansion
-(an unset variable without a default fails startup loudly). The example
-config is fully env-driven:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `EMAIL_ENABLED` | `true` | email channel on/off |
-| `SMTP_HOST` / `SMTP_PORT` | `localhost` / `25` | local relay, no TLS/auth |
-| `SMTP_FROM` / `SMTP_TO` | `killswitch@localhost` / `alerts@example.com` | addresses |
-| `HA_ENABLED` | `false` | Home Assistant channel on/off |
-| `HA_BASE_URL` | `http://homeassistant.local:8123` | HA instance |
-| `HA_TOKEN` | — (required when enabled) | long-lived access token (HA profile → Security) |
-| `HA_EVENT_TYPE` | `switch_killswitch` | event fired on the HA bus |
-| `KILL_DELAY` | `0` | standby delay for redundant instances (seconds) |
-
-- **Email** — SMTP via stdlib; starttls/ssl also supported in config for
-  non-local relays, with optional auth.
+- **Email** — SMTP via stdlib; defaults to an unauthenticated local relay
+  at `localhost:25`, with `SMTP_SECURITY=starttls|ssl` and
+  `SMTP_USERNAME`/`SMTP_PASSWORD` for non-local relays.
 - **Home Assistant** — fires the event on the HA event bus with the full
   payload (switch, ifindex, reason, verified, timestamp); react with an
   automation:

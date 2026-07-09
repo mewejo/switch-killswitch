@@ -2,26 +2,11 @@ services:
   killswitch:
     image: ghcr.io/mewejo/switch-killswitch:latest
     build: .
-    # Host networking: the poller needs to reach the switch's management IP,
-    # and the default SMTP target (localhost:25) means the relay on the
-    # docker host. No inbound ports are ever opened — polling is
-    # outbound-only. Run this on a host attached to the management VLAN.
+    # Host networking: the poller must reach the switch's management IP, and
+    # the default SMTP target (localhost:25) means the relay on the docker
+    # host. No inbound ports are ever opened — polling is outbound-only.
     network_mode: host
     restart: unless-stopped
-    # run as the host user that owns secrets/ (they're chmod 600)
-    user: "${PUID:-1000}"
-    volumes:
-      - ./config:/app/config:ro
-      - ./secrets:/app/secrets:ro
-    environment:
-      # 0 = primary; set to e.g. 3 on redundant standby instances
-      KILL_DELAY: ${KILL_DELAY:-0}
-      EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
-      SMTP_HOST: ${SMTP_HOST:-localhost}
-      SMTP_PORT: ${SMTP_PORT:-25}
-      SMTP_FROM: ${SMTP_FROM:-killswitch@localhost}
-      SMTP_TO: ${SMTP_TO:-alerts@example.com}
-      HA_ENABLED: ${HA_ENABLED:-false}
-      HA_BASE_URL: ${HA_BASE_URL:-http://homeassistant.local:8123}
-      HA_TOKEN: ${HA_TOKEN:-}
-      HA_EVENT_TYPE: ${HA_EVENT_TYPE:-switch_killswitch}
+    # All configuration comes from the environment — no volumes needed.
+    # Copy .env.example to .env and fill it in.
+    env_file: .env
