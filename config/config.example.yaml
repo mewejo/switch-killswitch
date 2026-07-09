@@ -1,0 +1,50 @@
+# Copy to config/config.yaml (gitignored) and adjust for your network.
+
+# SNMPv3 credentials used for polling link state and for the shutdown SET.
+snmp:
+  user: "portshut-user"
+  auth_protocol: "SHA"          # MD5 | SHA | SHA224 | SHA256 | SHA384 | SHA512
+  auth_password_file: "secrets/snmp_auth"
+  priv_protocol: "DES"          # DES | AES | AES192 | AES256 — match the switch
+  priv_password_file: "secrets/snmp_priv"
+
+# Detection is polling-only by design: no inbound ports, no reliance on the
+# switch's trap engine (which some firmware ships broken — see
+# docs/fastpath-notes.md). ifLastChange is polled alongside ifOperStatus to
+# catch flaps that happen entirely between two polls.
+poll:
+  interval_seconds: 0.5
+
+# Multiple instances may run for redundancy: every instance stands down if
+# the port is already admin-down. KILL_DELAY=0 on the primary; a few seconds
+# on standbys so they only act (and notify) if the primary didn't.
+redundancy:
+  standby_delay_seconds: "${KILL_DELAY:-0}"
+
+rate_limit:
+  max_actions: 10
+  per_seconds: 60
+
+# Fired on: port_killed (confirmed), kill_failed, rate_limited.
+notifications:
+  email:
+    enabled: "${EMAIL_ENABLED:-true}"
+    smtp_host: "${SMTP_HOST:-localhost}"
+    smtp_port: "${SMTP_PORT:-25}"
+    security: "none"            # starttls | ssl | none
+    from: "${SMTP_FROM:-killswitch@localhost}"
+    to:
+      - "${SMTP_TO:-alerts@example.com}"
+    subject_prefix: "[killswitch]"
+  home_assistant:
+    enabled: "${HA_ENABLED:-false}"
+    base_url: "${HA_BASE_URL:-http://homeassistant.local:8123}"
+    token_env: "HA_TOKEN"
+    event_type: "${HA_EVENT_TYPE:-switch_killswitch}"
+
+switches:
+  - name: "switch-1"
+    ip: "192.0.2.10"
+    allowed_ifindexes:          # ports the killswitch may shut; verify the
+      - 24                      # ifIndex mapping with an ifDescr walk first
+    debounce_seconds: 10

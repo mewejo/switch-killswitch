@@ -1,0 +1,11 @@
+.git/
+.venv/
+.nwave/
+secrets/
+config/
+tests/
+__pycache__/
+*.pyc
+*.md
+.github/
+docker-compose.yml

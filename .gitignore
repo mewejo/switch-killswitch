@@ -1,0 +1,7 @@
+.venv/
+secrets/
+__pycache__/
+*.pyc
+.env
+config/config.yaml
+*.local.md
