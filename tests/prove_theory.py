@@ -157,7 +157,15 @@ class FakePort:
         self.last_change.syntax = TimeTicks(int(self.last_change.syntax) + 100)
 
 
+_MIB_BUILDER = None
+
+
+def add_fake_port(ifindex: int) -> FakePort:
+    return FakePort(_MIB_BUILDER, ifindex)
+
+
 def start_fake_switch_agent() -> FakePort:
+    global _MIB_BUILDER
     agent = engine.SnmpEngine()
     ecfg.add_transport(
         agent,
@@ -177,7 +185,8 @@ def start_fake_switch_agent() -> FakePort:
         (1, 3, 6, 1, 2, 1, 2, 2, 1, 7),
     )
     snmp_context = context.SnmpContext(agent)
-    port = FakePort(snmp_context.get_mib_instrum().get_mib_builder(), 24)
+    _MIB_BUILDER = snmp_context.get_mib_instrum().get_mib_builder()
+    port = FakePort(_MIB_BUILDER, 24)
     cmdrsp.GetCommandResponder(agent, snmp_context)
     cmdrsp.SetCommandResponder(agent, snmp_context)
     agent.transport_dispatcher.job_started(1)
@@ -216,6 +225,7 @@ snmp:
 
 poll:
   interval_seconds: {POLL_INTERVAL}
+  arm_delay_seconds: 0   # scenarios 1-4 test the always-armed hair trigger
 
 notifications:
   email:
@@ -351,6 +361,54 @@ async def main() -> int:
         "invisible flap triggers admin-down",
         int(port.admin.syntax) == 2 and counter.actions == 2,
         f"(ifAdminStatus.24={int(port.admin.syntax)}, actions={counter.actions})",
+    )
+
+    # --- Scenarios A: arming delay — bring-up blips forgiven, real pulls not ---
+    log.info("=== scenario A: arming delay (settle window after link-up) ===")
+    ARM_DELAY, ARM_PERSIST = 2.0, 1.0
+    arm_cfg_text = (tmp / "config.yaml").read_text().replace(
+        "arm_delay_seconds: 0   # scenarios 1-4 test the always-armed hair trigger",
+        f"arm_delay_seconds: {ARM_DELAY}\n  unarmed_persist_seconds: {ARM_PERSIST}",
+    ).replace("allowed_ifindexes: [24]", "allowed_ifindexes: [26]"
+    ).replace(f"debounce_seconds: {DEBOUNCE}", "debounce_seconds: 2")
+    (tmp / "arm_config.yaml").write_text(arm_cfg_text)
+    arm_port = add_fake_port(26)
+    arm_cfg = load_config(str(tmp / "arm_config.yaml"))
+    arm_actor = PortShutdownActor(arm_cfg)  # no notifier: kills counted via admin status
+    arm_poller = LinkPoller(arm_cfg, arm_actor)
+    arm_poller.start()
+    await settle()  # baseline up; port is now SETTLING (up < ARM_DELAY)
+
+    # A1: quick blip while settling -> forgiven
+    arm_port.set_link(up=False)
+    await asyncio.sleep(POLL_INTERVAL + 0.2)   # one poll sees it down (pending)
+    arm_port.set_link(up=True)
+    await settle()
+    check(
+        "bring-up blip while settling is forgiven",
+        int(arm_port.admin.syntax) == 1,
+        f"(ifAdminStatus.26={int(arm_port.admin.syntax)})",
+    )
+
+    # A2: sustained drop while settling -> still killed (after persist)
+    arm_port.set_link(up=False)
+    await asyncio.sleep(ARM_PERSIST + POLL_INTERVAL * 2 + 0.5)
+    check(
+        "sustained drop during settle window still kills",
+        int(arm_port.admin.syntax) == 2,
+        f"(ifAdminStatus.26={int(arm_port.admin.syntax)})",
+    )
+
+    # A3: once armed (up >= ARM_DELAY), a drop kills instantly
+    arm_port.admin.syntax = Integer(1)
+    arm_port.set_link(up=True)
+    await asyncio.sleep(ARM_DELAY + 1.0)       # let it arm (also clears debounce)
+    arm_port.set_link(up=False)
+    await asyncio.sleep(POLL_INTERVAL * 3 + 0.5)
+    check(
+        "armed port still killed instantly",
+        int(arm_port.admin.syntax) == 2,
+        f"(ifAdminStatus.26={int(arm_port.admin.syntax)})",
     )
 
     # --- Scenario E: file-less config, entirely from environment variables ---

@@ -14,6 +14,11 @@ snmp:
 # catch flaps that happen entirely between two polls.
 poll:
   interval_seconds: 0.5
+  # A port must be continuously up this long before it's on the instant
+  # trigger — links commonly bounce once right after an admin re-enable.
+  # While settling, a drop must persist unarmed_persist_seconds to kill.
+  arm_delay_seconds: "${ARM_DELAY:-30}"
+  unarmed_persist_seconds: "${ARM_PERSIST:-5}"
 
 # Multiple instances may run for redundancy: every instance stands down if
 # the port is already admin-down. KILL_DELAY=0 on the primary; a few seconds

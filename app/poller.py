@@ -20,12 +20,21 @@ Triggers:
 
 A port first seen in the down state is baseline, not a trigger, so
 restarting the service against an already-killed port does nothing.
+
+Arming: links commonly bounce once shortly after an admin re-enable
+(autonegotiation restart, PoE device init, device-side interface reset).
+A port must therefore be continuously up for `arm_delay` before it is on
+the instant trigger; while still settling, a drop must persist
+`unarmed_persist` seconds to fire — bring-up blips are forgiven, a real
+pull during the window still kills, just a few seconds later.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 
 from pysnmp.hlapi.v3arch.asyncio import (
     ContextData,
@@ -48,13 +57,20 @@ UP = 1
 DOWN_STATES = {2, 7}  # down, lowerLayerDown
 
 
+@dataclass
+class PortState:
+    oper: int
+    last_change: int
+    up_since: float | None      # monotonic time the current up-streak began
+    pending_since: float | None = None  # unarmed down observed at this time
+
+
 class LinkPoller:
     def __init__(self, cfg: Config, actor: PortShutdownActor) -> None:
         self._cfg = cfg
         self._actor = actor
         self._engine = SnmpEngine()
-        # (switch_ip, ifindex) -> (oper, last_change)
-        self._last: dict[tuple[str, int], tuple[int, int]] = {}
+        self._state: dict[tuple[str, int], PortState] = {}
         self._tasks: list[asyncio.Task] = []
 
     def start(self) -> None:
@@ -101,6 +117,7 @@ class LinkPoller:
             await asyncio.sleep(self._cfg.poll_interval)
 
     def _evaluate(self, switch: SwitchConfig, ifindexes: list[int], var_binds) -> None:
+        now = time.monotonic()
         n = len(ifindexes)
         for pos, ifindex in enumerate(ifindexes):
             try:
@@ -112,24 +129,69 @@ class LinkPoller:
                 )
                 continue
             key = (switch.ip, ifindex)
-            prev = self._last.get(key)
-            self._last[key] = (oper, last_change)
-            if prev is None:
-                log.info(
-                    "baseline switch=%s ifindex=%d oper=%d", switch.name, ifindex, oper
+            state = self._state.get(key)
+            if state is None:
+                self._state[key] = PortState(
+                    oper, last_change, up_since=now if oper == UP else None
                 )
+                log.info("baseline switch=%s ifindex=%d oper=%d", switch.name, ifindex, oper)
                 continue
-            prev_oper, prev_change = prev
-            if prev_oper == UP and oper in DOWN_STATES:
-                reason = "link transition up->down"
-            elif prev_oper == UP and oper == UP and last_change != prev_change:
-                reason = "link flapped between polls (or agent restarted)"
-            else:
-                continue
-            log.warning(
-                "POLL MATCH: %s — switch=%s ifindex=%d", reason, switch.name, ifindex
-            )
-            task = asyncio.get_event_loop().create_task(
-                self._actor.shutdown_port(switch, ifindex, reason)
-            )
-            task.add_done_callback(lambda t: t.exception())
+            self._transition(switch, ifindex, state, oper, last_change, now)
+            state.oper = oper
+            state.last_change = last_change
+
+    def _transition(self, switch: SwitchConfig, ifindex: int, state: PortState,
+                    oper: int, last_change: int, now: float) -> None:
+        armed = (
+            state.up_since is not None
+            and now - state.up_since >= self._cfg.arm_delay
+        )
+        if oper == UP:
+            if state.oper == UP and last_change != state.last_change:
+                # link dropped and recovered entirely between two polls
+                if armed:
+                    self._kill(switch, ifindex,
+                               "link flapped between polls (or agent restarted)")
+                else:
+                    log.info(
+                        "forgiven: bring-up blip while settling (up %.1fs < arm %.0fs) "
+                        "switch=%s ifindex=%d — settle timer restarted",
+                        now - (state.up_since or now), self._cfg.arm_delay,
+                        switch.name, ifindex,
+                    )
+                state.up_since = now  # a bounce restarts the settle window
+            elif state.oper != UP:
+                if state.pending_since is not None:
+                    log.info(
+                        "forgiven: link back up %.1fs after unarmed drop switch=%s ifindex=%d",
+                        now - state.pending_since, switch.name, ifindex,
+                    )
+                state.up_since = now
+            state.pending_since = None
+        elif oper in DOWN_STATES:
+            if state.oper == UP:
+                if armed:
+                    self._kill(switch, ifindex, "link transition up->down")
+                    state.up_since = None
+                else:
+                    state.pending_since = now
+                    log.warning(
+                        "link down while settling (up %.1fs < arm %.0fs) — kill fires "
+                        "if still down in %.0fs switch=%s ifindex=%d",
+                        now - (state.up_since or now), self._cfg.arm_delay,
+                        self._cfg.unarmed_persist, switch.name, ifindex,
+                    )
+            elif (
+                state.pending_since is not None
+                and now - state.pending_since >= self._cfg.unarmed_persist
+            ):
+                state.pending_since = None
+                state.up_since = None
+                self._kill(switch, ifindex, "sustained link-down during settle window")
+
+    def _kill(self, switch: SwitchConfig, ifindex: int, reason: str) -> None:
+        log.warning("POLL MATCH: %s — switch=%s ifindex=%d", reason, switch.name, ifindex)
+        task = asyncio.get_event_loop().create_task(
+            self._actor.shutdown_port(switch, ifindex, reason)
+        )
+        task.add_done_callback(lambda t: t.exception())

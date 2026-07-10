@@ -118,6 +118,13 @@ class Config:
     snmp: SnmpCredentials
     switches: dict[str, SwitchConfig]  # keyed by switch IP
     poll_interval: float = 1.0
+    # A port must be continuously up this long before it is "armed" for
+    # instant kills. Links commonly bounce once shortly after an admin
+    # re-enable (autoneg restart, PoE device init); while settling, a drop
+    # must persist unarmed_persist seconds to trigger — so bring-up blips
+    # are forgiven but a real pull during the window still kills.
+    arm_delay: float = 30.0
+    unarmed_persist: float = 5.0
     # Redundancy: multiple instances may watch the same switch. Before
     # acting, an instance re-reads ifAdminStatus and stands down if a peer
     # already shut the port. standby_delay staggers instances so only the
@@ -219,7 +226,11 @@ def load_config_from_env() -> Config:
             "priv_protocol": env.get("SNMP_PRIV_PROTOCOL", "DES"),
             "priv_password_env": "SNMP_PRIV_PASSWORD",
         },
-        "poll": {"interval_seconds": env.get("POLL_INTERVAL", 0.5)},
+        "poll": {
+            "interval_seconds": env.get("POLL_INTERVAL", 0.5),
+            "arm_delay_seconds": env.get("ARM_DELAY", 30),
+            "unarmed_persist_seconds": env.get("ARM_PERSIST", 5),
+        },
         "redundancy": {"standby_delay_seconds": env.get("KILL_DELAY", 0)},
         "rate_limit": {
             "max_actions": env.get("RATE_MAX_ACTIONS", 10),
@@ -305,6 +316,10 @@ def _build_config(raw: dict) -> Config:
     poll_interval = float(poll_raw.get("interval_seconds", 1.0))
     if poll_interval < MIN_POLL_INTERVAL:
         raise ConfigError(f"poll.interval_seconds must be >= {MIN_POLL_INTERVAL}")
+    arm_delay = float(poll_raw.get("arm_delay_seconds", 30.0))
+    unarmed_persist = float(poll_raw.get("unarmed_persist_seconds", 5.0))
+    if arm_delay < 0 or unarmed_persist < 0:
+        raise ConfigError("poll.arm_delay_seconds and unarmed_persist_seconds must be >= 0")
 
     redundancy_raw = raw.get("redundancy") or {}
     standby_delay = float(redundancy_raw.get("standby_delay_seconds", 0.0))
@@ -327,6 +342,8 @@ def _build_config(raw: dict) -> Config:
         snmp=creds,
         switches=switches,
         poll_interval=poll_interval,
+        arm_delay=arm_delay,
+        unarmed_persist=unarmed_persist,
         standby_delay=standby_delay,
         rate_limit=rate_limit,
         notifications=notifications,

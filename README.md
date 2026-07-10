@@ -22,6 +22,12 @@ FASTPATH — extra notes for that family in `docs/fastpath-notes.md`).
   read-back to verify. Debounced per port, rate-limited globally.
 - **Never un-kill** — re-enabling is manual, on the switch. A port that is
   already down when the service starts is baseline, never retro-killed.
+- **Arming delay** — links commonly bounce once shortly after an admin
+  re-enable (autoneg restart, PoE device init), so a port must be
+  continuously up for `ARM_DELAY` (default 30s) before it's on the instant
+  trigger. While settling, a drop must persist `ARM_PERSIST` (default 5s)
+  to fire — bring-up blips are forgiven, a real pull during the window
+  still kills, just a few seconds later.
 
 ## Configuration
 
