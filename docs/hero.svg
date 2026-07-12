@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="500" viewBox="0 0 960 500" role="img" aria-label="switch-killswitch: when a watched port loses link, it is shut down over SNMP and stays down until an admin re-enables it">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1526"/>
+      <stop offset="1" stop-color="#0a0f1c"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f26d6d"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+  </defs>
+
+  <style>
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .title   { fill: #e8edf7; font-size: 34px; font-weight: 700; letter-spacing: -0.5px; }
+    .tag     { fill: #93a1c0; font-size: 15px; }
+    .step    { fill: #64748b; font-size: 11px; letter-spacing: 2px; font-weight: 700; }
+    .head    { fill: #e8edf7; font-size: 16px; font-weight: 700; }
+    .body    { fill: #93a1c0; font-size: 12px; }
+    .code    { fill: #b9c5de; font-size: 12px; }
+    .red     { fill: #f26d6d; }
+    .green   { fill: #4ade80; }
+    .amber   { fill: #fbbf24; }
+  </style>
+
+  <!-- background -->
+  <rect width="960" height="500" rx="14" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="959" height="499" rx="13.5" fill="none" stroke="#243252"/>
+  <rect x="0" y="0" width="960" height="4" fill="url(#accent)" opacity="0.9"/>
+
+  <!-- title -->
+  <text x="60" y="72" class="title">switch-killswitch</text>
+  <text x="60" y="100" class="tag">Pull the cable, lose the port. Link loss becomes a security event, not an inconvenience.</text>
+
+  <!-- ============ panel 1: link drops ============ -->
+  <g transform="translate(60,150)">
+    <rect width="252" height="290" rx="12" fill="#121b30" stroke="#243252"/>
+    <text x="24" y="42" class="step">STEP 1</text>
+    <text x="24" y="70" class="head">A watched port</text>
+    <text x="24" y="92" class="head">loses link</text>
+
+    <!-- switch faceplate -->
+    <g transform="translate(24,120)">
+      <rect width="204" height="64" rx="8" fill="#0b1120" stroke="#2c3b5e"/>
+      <circle cx="16" cy="32" r="3.5" fill="#4ade80"/>
+      <!-- ports -->
+      <g>
+        <rect x="34"  y="18" width="26" height="28" rx="3" fill="#1a2540" stroke="#33436b"/>
+        <rect x="66"  y="18" width="26" height="28" rx="3" fill="#1a2540" stroke="#33436b"/>
+        <rect x="98"  y="18" width="26" height="28" rx="3" fill="#1a2540" stroke="#33436b"/>
+        <rect x="130" y="18" width="26" height="28" rx="3" fill="#2a1622" stroke="#f26d6d"/>
+        <rect x="162" y="18" width="26" height="28" rx="3" fill="#1a2540" stroke="#33436b"/>
+      </g>
+      <!-- link LEDs -->
+      <circle cx="47"  cy="14" r="2.5" fill="#4ade80"/>
+      <circle cx="79"  cy="14" r="2.5" fill="#4ade80"/>
+      <circle cx="111" cy="14" r="2.5" fill="#4ade80"/>
+      <circle cx="143" cy="14" r="2.5" fill="#f26d6d"/>
+      <circle cx="175" cy="14" r="2.5" fill="#4ade80"/>
+    </g>
+
+    <!-- pulled cable -->
+    <g transform="translate(24,120)">
+      <path d="M143 52 C 143 78, 120 84, 96 96" fill="none" stroke="#f26d6d" stroke-width="4" stroke-linecap="round" stroke-dasharray="1 9"/>
+      <rect x="84" y="92" width="18" height="12" rx="2" fill="#f26d6d" transform="rotate(-28 93 98)"/>
+    </g>
+
+    <text x="24" y="252" class="body">Cable pulled, device swapped,</text>
+    <text x="24" y="270" class="body">or a reboot revives the port.</text>
+  </g>
+
+  <!-- arrow 1 -->
+  <g stroke="#3b4c76" stroke-width="2" fill="none">
+    <path d="M320 295 H 344"/>
+    <path d="M338 288 L 346 295 L 338 302" fill="none"/>
+  </g>
+
+  <!-- ============ panel 2: kill ============ -->
+  <g transform="translate(354,150)">
+    <rect width="252" height="290" rx="12" fill="#121b30" stroke="#243252"/>
+    <text x="24" y="42" class="step">STEP 2</text>
+    <text x="24" y="70" class="head">Killed within</text>
+    <text x="24" y="92" class="head">a second</text>
+
+    <!-- terminal -->
+    <g transform="translate(24,116)">
+      <rect width="204" height="112" rx="8" fill="#0b1120" stroke="#2c3b5e"/>
+      <circle cx="16" cy="16" r="3.5" fill="#f26d6d"/>
+      <circle cx="28" cy="16" r="3.5" fill="#fbbf24"/>
+      <circle cx="40" cy="16" r="3.5" fill="#4ade80"/>
+      <text x="14" y="44"  class="code">poll ifOperStatus 0.5s</text>
+      <text x="14" y="64"  class="code"><tspan class="red">link lost</tspan> ifIndex 24</text>
+      <text x="14" y="84"  class="code">SET ifAdminStatus=<tspan class="red">down(2)</tspan></text>
+      <text x="14" y="104" class="code">read-back: down <tspan class="green">✓</tspan></text>
+    </g>
+
+    <text x="24" y="252" class="body">SNMPv3 authPriv, outbound only.</text>
+    <text x="24" y="270" class="body">No traps, no inbound ports.</text>
+  </g>
+
+  <!-- arrow 2 -->
+  <g stroke="#3b4c76" stroke-width="2" fill="none">
+    <path d="M614 295 H 638"/>
+    <path d="M632 288 L 640 295 L 632 302" fill="none"/>
+  </g>
+
+  <!-- ============ panel 3: latched ============ -->
+  <g transform="translate(648,150)">
+    <rect width="252" height="290" rx="12" fill="#121b30" stroke="#243252"/>
+    <text x="24" y="42" class="step">STEP 3</text>
+    <text x="24" y="70" class="head">Latched down,</text>
+    <text x="24" y="92" class="head">you get told</text>
+
+    <!-- padlock -->
+    <g transform="translate(84,116)">
+      <rect x="0" y="34" width="84" height="62" rx="10" fill="#2a1622" stroke="#f26d6d" stroke-width="2"/>
+      <path d="M18 34 V 24 a24 24 0 0 1 48 0 V 34" fill="none" stroke="#f26d6d" stroke-width="6" stroke-linecap="round"/>
+      <circle cx="42" cy="60" r="8" fill="#f26d6d"/>
+      <rect x="38" y="62" width="8" height="18" rx="3" fill="#f26d6d"/>
+    </g>
+
+    <text x="24" y="252" class="body">Never auto re-enabled. Alerts via</text>
+    <text x="24" y="270" class="body">email + Home Assistant.</text>
+  </g>
+
+  <!-- footer -->
+  <text x="60" y="472" class="body" opacity="0.8">Vendor-agnostic · any managed switch with SNMPv3 write to IF-MIB · runs anywhere Python or Docker does</text>
+</svg>

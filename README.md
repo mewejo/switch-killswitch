@@ -1,58 +1,84 @@
+<p align="center">
+  <img src="docs/hero.svg" alt="switch-killswitch — when a watched port loses link, it is shut down over SNMP and stays down until an admin re-enables it" width="960">
+</p>
+
 # switch-killswitch
 
-When a watched switch port loses link, administratively shut it
-(`ifAdminStatus = down(2)`) so plugging anything back in does nothing until
-an admin manually re-enables the port. Useful wherever an unplugged cable
-should be treated as a security event rather than an inconvenience.
+**If someone unplugs a cable from a watched switch port, that port gets shut
+off — and stays off until a human turns it back on.**
 
-Vendor-agnostic: works against any managed switch that supports SNMPv3 with
-write access to standard IF-MIB (tested on Ubiquiti EdgeSwitch / Broadcom
-FASTPATH — extra notes for that family in `docs/fastpath-notes.md`).
+Think of the network drop in a lobby, a door controller, a camera on a pole,
+or that one port in a meeting room: places where an unplugged cable should be
+treated as a security event, not an inconvenience. When a watched port loses
+link, switch-killswitch administratively shuts it (`ifAdminStatus = down(2)`),
+so plugging *anything* back in does nothing until an admin manually
+re-enables the port.
+
+It's vendor-agnostic: it works against any managed switch that supports
+SNMPv3 with write access to the standard IF-MIB. It's tested on Ubiquiti
+EdgeSwitch / Broadcom FASTPATH — extra field notes for that family live in
+[`docs/fastpath-notes.md`](docs/fastpath-notes.md).
 
 ## How it works
 
-- **Detect** — polls `ifOperStatus` + `ifLastChange` for the allowlisted
-  ports (default every 0.5s) over SNMPv3 authPriv. Polling was chosen over
-  traps deliberately: no inbound ports, no reliance on the switch's trap
-  engine (which some firmware ships broken), and the `ifLastChange`
-  comparison catches drops that recover between two polls — a fast device
-  swap can't slip through unseen. A switch reboot also moves `ifLastChange`,
-  so a power-cycle that would revive an unsaved admin-down gets re-killed.
-- **Kill** — SNMPv3 SET of `ifAdminStatus.<ifIndex> = down(2)`, then a
-  read-back to verify. Debounced per port, rate-limited globally.
-- **Never un-kill** — re-enabling is manual, on the switch. A port that is
-  already down when the service starts is baseline, never retro-killed.
-- **Arming delay** — links commonly bounce once shortly after an admin
-  re-enable (autoneg restart, PoE device init), so a port must be
-  continuously up for `ARM_DELAY` (default 30s) before it's on the instant
-  trigger. While settling, a drop must persist `ARM_PERSIST` (default 5s)
-  to fire — bring-up blips are forgiven, a real pull during the window
-  still kills, just a few seconds later.
+1. **Detect.** The service polls `ifOperStatus` + `ifLastChange` for the
+   allowlisted ports (default every 0.5 s) over SNMPv3 authPriv. Polling was
+   chosen over traps deliberately: no inbound ports, no reliance on the
+   switch's trap engine (which some firmware ships broken), and the
+   `ifLastChange` comparison catches drops that recover between two polls —
+   a fast device swap can't slip through unseen. A switch reboot also moves
+   `ifLastChange`, so a power-cycle that would revive an unsaved admin-down
+   gets re-killed.
 
-## Configuration
+2. **Kill.** An SNMPv3 SET of `ifAdminStatus.<ifIndex> = down(2)`, then a
+   read-back to verify it actually took. Actions are debounced per port and
+   rate-limited globally, so a misbehaving switch can't trigger a storm.
 
-Entirely via **environment variables** — the service needs no files or
-persistent storage. Copy `.env.example` to `.env` and fill in the three
-required values:
+3. **Stay killed.** The service never re-enables a port — that's a manual
+   action, done on the switch, by a human. A port that is already down when
+   the service starts is treated as baseline and never retro-killed.
 
-```
-SWITCHES=core@192.0.2.10:24        # name@ip:ifIndex[,ifIndex] entries, ;-separated
-SNMP_AUTH_PASSWORD=...
-SNMP_PRIV_PASSWORD=...
-```
+### The arming delay (why a re-enabled port isn't instantly re-killed)
 
-Everything else (SNMP protocols, poll interval, debounce, rate limit,
-notifications, redundancy delay) has sensible defaults — see `.env.example`
-for the full reference. Create a dedicated SNMPv3 user on the switch with
-those credentials (write access to ifAdminStatus; the narrower the view the
-better), and verify the ifIndex mapping with an ifDescr walk before
-trusting it.
+Links commonly bounce once shortly after an admin re-enables a port — autoneg
+restarts, PoE devices reinitialise. So a port must be continuously up for
+`ARM_DELAY` (default 30 s) before it's on the instant trigger. While the port
+is still settling, a drop must persist for `ARM_PERSIST` (default 5 s) to
+fire. Bring-up blips are forgiven; a real cable pull during the window still
+kills the port, just a few seconds later.
 
-A YAML file (`config/config.example.yaml`) is also supported for local
-development: pass `--config <path>`; its values support `${VAR:-default}`
-env expansion.
+## Quick start
 
-## Run
+1. On the switch, create a dedicated SNMPv3 user with write access to
+   `ifAdminStatus` (the narrower the view, the better — FASTPATH examples in
+   [`docs/fastpath-notes.md`](docs/fastpath-notes.md)).
+2. Find the ifIndex of each port you want to watch (do an `ifDescr` walk and
+   double-check the mapping before trusting it).
+3. Copy `.env.example` to `.env` and fill in the three required values:
+
+   ```
+   SWITCHES=core@192.0.2.10:24        # name@ip:ifIndex[,ifIndex] entries, ;-separated
+   SNMP_AUTH_PASSWORD=...
+   SNMP_PRIV_PASSWORD=...
+   ```
+
+4. Start it:
+
+   ```
+   docker compose up -d
+   ```
+
+That's it — everything else (SNMP protocols, poll interval, debounce, rate
+limit, notifications, redundancy delay) has sensible defaults. The full
+reference is [`.env.example`](.env.example), which documents every knob.
+
+Configuration is entirely via **environment variables** — the service needs
+no files or persistent storage. A YAML file
+([`config/config.example.yaml`](config/config.example.yaml)) is also
+supported for local development: pass `--config <path>`; its values support
+`${VAR:-default}` env expansion.
+
+## Running it
 
 ### Docker
 
@@ -60,12 +86,12 @@ env expansion.
 docker compose up -d
 ```
 
-No volumes, no mounts — config is the environment (`env_file: .env`). Uses
-host networking (must reach the switch's management IP; the default SMTP
+No volumes, no mounts — config is the environment (`env_file: .env`). It uses
+host networking (it must reach the switch's management IP; the default SMTP
 target `localhost:25` means the relay on the docker host). No inbound ports
 are ever opened. Run it on a host attached to the switch's management
-network. The image is built and published by GitHub Actions on every push
-to main. Or without compose:
+network. The image is built and published by GitHub Actions on every push to
+main. Or without compose:
 
 ```
 docker run -d --restart unless-stopped --network host --env-file .env \
@@ -86,20 +112,26 @@ No privileged ports, no root: the service only makes outbound SNMP requests.
 
 Run as many instances as you like, on different hosts. Before acting, every
 instance re-reads `ifAdminStatus` and stands down — no SET, no notification —
-if the port is already shut, so the switch itself is the coordination point.
-Stagger instances with `KILL_DELAY`: `0` on the primary, a few seconds on
-standbys, so a standby acts only when the primary failed to. Two instances
-at delay 0 still converge (the SET is idempotent); the worst case is a
-duplicate notification in the sub-second race window.
+if the port is already shut, so **the switch itself is the coordination
+point**. Stagger instances with `KILL_DELAY`: `0` on the primary, a few
+seconds on standbys, so a standby acts only when the primary failed to. Two
+instances at delay 0 still converge (the SET is idempotent); the worst case
+is a duplicate notification in the sub-second race window.
 
 ## Notifications
 
-Events: `port_killed` (confirmed), `kill_failed` (SET rejected or read-back
-mismatch), `rate_limited` (storm guard refused an action). Notification
-failures are logged and never block the kill path.
+Three events can fire:
 
-- **Email** — SMTP via stdlib; defaults to an unauthenticated local relay
-  at `localhost:25`, with `SMTP_SECURITY=starttls|ssl` and
+| Event | Meaning |
+| --- | --- |
+| `port_killed` | A port was shut and the read-back confirmed it |
+| `kill_failed` | The SET was rejected, or the read-back didn't match |
+| `rate_limited` | The storm guard refused an action |
+
+Notification failures are logged and never block the kill path.
+
+- **Email** — SMTP via the Python stdlib; defaults to an unauthenticated
+  local relay at `localhost:25`, with `SMTP_SECURITY=starttls|ssl` and
   `SMTP_USERNAME`/`SMTP_PASSWORD` for non-local relays.
 - **Home Assistant** — fires the event on the HA event bus with the full
   payload (switch, ifindex, reason, verified, timestamp); react with an
@@ -119,10 +151,10 @@ failures are logged and never block the kill path.
           {{ trigger.event.data.switch }} ({{ trigger.event.data.reason }})
   ```
 
-## Test
+## Testing
 
-Full local end-to-end proof — fake SNMPv3 switch agent, SMTP sink, and fake
-Home Assistant API; no hardware needed:
+Full local end-to-end proof — a fake SNMPv3 switch agent, an SMTP sink, and a
+fake Home Assistant API; no hardware needed:
 
 ```
 .venv/bin/python -m tests.prove_theory
