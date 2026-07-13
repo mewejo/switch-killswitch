@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 
 import yaml
@@ -122,6 +123,10 @@ class MqttControlConfig:
     password: str = ""
     tls: bool = False
     keepalive: int = 60
+    # MQTT requires a unique client id per connection — a broker force-kicks any
+    # existing client that reconnects with the same id. Left unset, this is
+    # derived per host so multiple redundant instances don't fight (see
+    # _load_mqtt_control). Pin it explicitly if you run several on one host.
     client_id: str = "switch-killswitch"
     discovery_prefix: str = "homeassistant"
     base_topic: str = "switch_killswitch"
@@ -226,6 +231,11 @@ def _load_mqtt_control(raw: dict) -> MqttControlConfig | None:
             if (raw.get("password_file") or raw.get("password_env") or raw.get("password"))
             else ""
         )
+    # Default to a per-host client id so redundant instances on different hosts
+    # don't collide (an MQTT broker force-disconnects a duplicate client id).
+    client_id = str(raw.get("client_id") or "").strip()
+    if not client_id:
+        client_id = f"switch-killswitch-{socket.gethostname()}"
     return MqttControlConfig(
         host=host,
         port=int(raw.get("port", 1883)),
@@ -233,7 +243,7 @@ def _load_mqtt_control(raw: dict) -> MqttControlConfig | None:
         password=password,
         tls=_as_bool(raw.get("tls")),
         keepalive=int(raw.get("keepalive", 60)),
-        client_id=str(raw.get("client_id", "switch-killswitch")),
+        client_id=client_id,
         discovery_prefix=str(raw.get("discovery_prefix", "homeassistant")).rstrip("/"),
         base_topic=str(raw.get("base_topic", "switch_killswitch")).rstrip("/"),
         device_id=str(raw.get("device_id", "switch_killswitch")),
@@ -327,7 +337,7 @@ def load_config_from_env() -> Config:
             "password_env": "MQTT_PASSWORD",
             "tls": env.get("MQTT_TLS", "false"),
             "keepalive": env.get("MQTT_KEEPALIVE", 60),
-            "client_id": env.get("MQTT_CLIENT_ID", "switch-killswitch"),
+            "client_id": env.get("MQTT_CLIENT_ID", ""),  # blank -> per-host default
             "discovery_prefix": env.get("MQTT_DISCOVERY_PREFIX", "homeassistant"),
             "base_topic": env.get("MQTT_BASE_TOPIC", "switch_killswitch"),
             "device_id": env.get("MQTT_DEVICE_ID", "switch_killswitch"),

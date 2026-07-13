@@ -175,6 +175,11 @@ class PortShutdownActor:
         automatic kill it is not debounced or rate-limited (a human asked for
         it), but the change is verified by read-back and always announced
         through the notifier so every manual re-enable/disable is auditable.
+
+        Redundancy-safe like the kill path: a broadcast MQTT toggle reaches
+        every instance, so each staggers by standby_delay and stands down —
+        no SET, no notification — if the port already reads the target state
+        (a peer got there first, or it was already so). Only one instance acts.
         """
         if ifindex not in switch.allowed_ifindexes:
             log.error(
@@ -186,6 +191,17 @@ class PortShutdownActor:
         verb = "re-enable" if target_up else "disable"
         kind = "port_restored" if target_up else "port_disabled"
         oid = f"{IF_ADMIN_STATUS}.{ifindex}"
+        # Stagger standbys behind the primary, then stand down if the port is
+        # already at the target (peer already applied it, or nothing to do).
+        if self._cfg.standby_delay > 0:
+            await asyncio.sleep(self._cfg.standby_delay)
+        if await self._read_admin_status(switch, ifindex, oid) == target:
+            log.info(
+                "manual %s: port already ifAdminStatus=%s (peer instance or "
+                "already so) — standing down switch=%s ifindex=%d",
+                verb, "up" if target_up else "down", switch.name, ifindex,
+            )
+            return False
         log.warning(
             "MANUAL %s: setting ifAdminStatus.%d = %s(%d) on switch=%s (%s) — %s",
             verb, ifindex, "up" if target_up else "down", target,

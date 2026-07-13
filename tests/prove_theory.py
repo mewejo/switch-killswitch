@@ -633,6 +633,37 @@ switches:
     )
     controller.stop()
 
+    # --- Scenario MR: a broadcast HA toggle is redundancy-safe ---
+    # An MQTT toggle reaches every instance; only one should act. A primary
+    # (standby_delay 0) and a standby (standby_delay > 0) both re-enable the
+    # same killed port concurrently -> one SET, one port_restored notification.
+    log.info("=== scenario MR: HA toggle across redundant instances ===")
+    standby_text = mqtt_cfg_text.replace(
+        "poll:", "redundancy:\n  standby_delay_seconds: 1.5\npoll:", 1
+    )
+    (tmp / "mqtt_standby.yaml").write_text(standby_text)
+    standby_cfg = load_config(str(tmp / "mqtt_standby.yaml"))
+    standby_actor = PortShutdownActor(standby_cfg, Notifier(standby_cfg))
+    primary_sw = mqtt_cfg.switches["127.0.0.1"]        # mqtt_actor: standby_delay 0
+    standby_sw = standby_cfg.switches["127.0.0.1"]
+    mqtt_agent_port.set_link(up=False)
+    mqtt_agent_port.admin.syntax = Integer(2)          # start from a killed port
+    restored_before = sum(1 for _, e in ha.events
+                          if e.get("event") == "port_restored" and e.get("ifindex") == 28)
+    await asyncio.gather(
+        mqtt_actor.set_admin(primary_sw, 28, True, reason="ha toggle"),
+        standby_actor.set_admin(standby_sw, 28, True, reason="ha toggle"),
+    )
+    await asyncio.sleep(0.4)  # let the single notification flush
+    restored_after = sum(1 for _, e in ha.events
+                         if e.get("event") == "port_restored" and e.get("ifindex") == 28)
+    check(
+        "redundant instances dedupe a toggle (one SET, one notification)",
+        int(mqtt_agent_port.admin.syntax) == 1 and (restored_after - restored_before) == 1,
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"restored_delta={restored_after - restored_before})",
+    )
+
     failed = [n for n, ok in CHECKS if not ok]
     print()
     print("=" * 64)

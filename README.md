@@ -192,6 +192,17 @@ a killed port is a security-relevant action, put the broker behind
 authentication (and ideally TLS), and restrict who can publish to the command
 topics.
 
+**Running [redundant instances](#redundancy)?** Enable this on one of them —
+the primary. Unlike the kill path, the HA surface is a visibility/control
+convenience, not the safety-critical function, so it doesn't need N-way
+redundancy: a single owner keeps the entity's availability clean if one host
+goes down (the killswitch itself stays redundant regardless). It degrades
+gracefully if you *do* enable it on several — each instance gets a distinct
+client id (`switch-killswitch-<hostname>` by default, overridable with
+`MQTT_CLIENT_ID`), and a toggle broadcast to all of them is deduplicated with
+the same `KILL_DELAY` stand-down as a kill, so only one instance actually
+acts and notifies.
+
 ## Testing
 
 Full local end-to-end proof — a fake SNMPv3 switch agent, an SMTP sink, a fake
