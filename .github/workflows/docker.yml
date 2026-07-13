@@ -6,9 +6,10 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Least privilege by default: PR runs (and the test job) get a read-only token.
+# Only the publish job below is granted packages: write.
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
@@ -33,6 +34,9 @@ jobs:
     needs: test
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # scoped here: only this job pushes to GHCR
     steps:
       - uses: actions/checkout@v4
 
