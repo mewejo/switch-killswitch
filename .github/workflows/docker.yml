@@ -1,6 +1,7 @@
 name: build-and-publish
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ["v*"]
@@ -10,7 +11,27 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # match the runtime image (Dockerfile)
+
+      - run: pip install --no-cache-dir -r requirements.txt
+
+      # End-to-end proof: fake SNMPv3 switch, SMTP sink, HA API and MQTT broker,
+      # all on localhost. Exits non-zero if any scenario fails.
+      - run: python -m tests.prove_theory
+
   docker:
+    # Publish only after the tests pass, and never for a pull request (no push
+    # to the registry from a PR — the test job above is the PR's gate).
+    needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
