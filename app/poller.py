@@ -61,7 +61,7 @@ DOWN_STATES = {2, 7}  # down, lowerLayerDown
 # Reports (switch, ifindex, oper_status, admin_status|None, last_change) each
 # poll. Purely for surfacing state (e.g. the Home Assistant MQTT entity);
 # link-down detection uses only oper/last_change.
-StateSink = Callable[[SwitchConfig, int, int, "int | None", int], None]
+StateSink = Callable[[SwitchConfig, int, int, int | None, int], None]
 
 
 @dataclass

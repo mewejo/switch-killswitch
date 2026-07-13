@@ -43,6 +43,7 @@ STATE_OFF = "OFF"
 AVAIL_ONLINE = "online"
 AVAIL_OFFLINE = "offline"
 _ON_PAYLOADS = {"ON", "1", "TRUE", "ONLINE", "UP", "ENABLE", "ENABLED"}
+_OFF_PAYLOADS = {"OFF", "0", "FALSE", "OFFLINE", "DOWN", "DISABLE", "DISABLED"}
 
 
 def _slug(value: str) -> str:
@@ -78,11 +79,13 @@ class HAController:
 
         self._ports: list[_Port] = []
         self._by_command: dict[str, _Port] = {}
+        self._by_port: dict[tuple[str, int], _Port] = {}
         for switch in cfg.switches.values():
             for ifindex in sorted(switch.allowed_ifindexes):
                 port = _Port(self._cfg, switch, ifindex)
                 self._ports.append(port)
                 self._by_command[port.command_topic] = port
+                self._by_port[(switch.ip, ifindex)] = port
 
         # Last published (state, attributes) per port — publish only on change.
         self._published: dict[str, tuple[str, str]] = {}
@@ -174,7 +177,19 @@ class HAController:
         port = self._by_command.get(topic)
         if port is None:
             return
-        want_up = payload.strip().upper() in _ON_PAYLOADS
+        # Accept only explicit on/off — never let a malformed payload fall
+        # through to "disable". Anything unrecognized is ignored, and we
+        # re-assert the real state so HA snaps back.
+        token = payload.strip().upper()
+        if token in _ON_PAYLOADS:
+            want_up = True
+        elif token in _OFF_PAYLOADS:
+            want_up = False
+        else:
+            log.warning("ignoring unrecognized MQTT command payload %r switch=%s ifindex=%d",
+                        payload, port.switch.name, port.ifindex)
+            self._republish_known(port)
+            return
         if want_up and not self._cfg.allow_reenable:
             log.warning("ignoring HA re-enable of switch=%s ifindex=%d (allow_reenable=false)",
                         port.switch.name, port.ifindex)
@@ -188,7 +203,18 @@ class HAController:
         log.warning("HA toggle: switch=%s ifindex=%d -> %s",
                     port.switch.name, port.ifindex, "up" if want_up else "down")
         task = self._loop.create_task(self._apply(port, want_up))
-        task.add_done_callback(lambda t: t.exception())
+        task.add_done_callback(
+            lambda t: self._log_task_error(t, port))
+
+    @staticmethod
+    def _log_task_error(task: asyncio.Task, port: _Port) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            log.error("HA toggle task failed switch=%s ifindex=%d: %s",
+                      port.switch.name, port.ifindex, exc, exc_info=exc)
 
     async def _apply(self, port: _Port, want_up: bool) -> None:
         ok = await self._actor.set_admin(
@@ -257,10 +283,7 @@ class HAController:
     # ------------------------------------------------------------------ helpers
 
     def _port_for(self, ip: str, ifindex: int) -> _Port | None:
-        for port in self._ports:
-            if port.switch.ip == ip and port.ifindex == ifindex:
-                return port
-        return None
+        return self._by_port.get((ip, ifindex))
 
     def _discovery_payload(self, port: _Port) -> dict:
         payload = {

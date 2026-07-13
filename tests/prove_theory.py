@@ -631,6 +631,17 @@ switches:
         len(restored) >= 1 and restored[-1].get("verified") is True,
         f"(restored_events={restored})",
     )
+
+    # A malformed command must NOT disable the port (no silent fall-through to OFF).
+    await broker.publish_to_subscribers(entity.command_topic, b"garbage")
+    await settle()
+    check(
+        "malformed MQTT command is ignored (port not disabled)",
+        int(mqtt_agent_port.admin.syntax) == 1
+        and broker.published.get(entity.state_topic) == b"ON",
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"state={broker.published.get(entity.state_topic)})",
+    )
     controller.stop()
 
     # --- Scenario MR: a broadcast HA toggle is redundancy-safe ---
