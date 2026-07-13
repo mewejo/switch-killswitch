@@ -35,6 +35,7 @@ from .notify import Notifier, make_event
 log = logging.getLogger("killswitch.actor")
 
 IF_ADMIN_STATUS = "1.3.6.1.2.1.2.2.1.7"
+ADMIN_UP = 1
 ADMIN_DOWN = 2
 
 AUTH_MAP = {
@@ -164,6 +165,58 @@ class PortShutdownActor:
         else:
             await self._notify("kill_failed", switch, ifindex,
                                f"{reason}; SET sent but verification failed", verified=False)
+        return ok
+
+    async def set_admin(self, switch: SwitchConfig, ifindex: int, target_up: bool,
+                        reason: str = "manual toggle") -> bool:
+        """Deliberately drive ifAdminStatus to up(1) or down(2) and verify.
+
+        This is the on-demand path behind the Home Assistant toggle: unlike the
+        automatic kill it is not debounced or rate-limited (a human asked for
+        it), but the change is verified by read-back and always announced
+        through the notifier so every manual re-enable/disable is auditable.
+        """
+        if ifindex not in switch.allowed_ifindexes:
+            log.error(
+                "refusing manual admin change for unallowlisted port switch=%s ifindex=%d",
+                switch.name, ifindex,
+            )
+            return False
+        target = ADMIN_UP if target_up else ADMIN_DOWN
+        verb = "re-enable" if target_up else "disable"
+        kind = "port_restored" if target_up else "port_disabled"
+        oid = f"{IF_ADMIN_STATUS}.{ifindex}"
+        log.warning(
+            "MANUAL %s: setting ifAdminStatus.%d = %s(%d) on switch=%s (%s) — %s",
+            verb, ifindex, "up" if target_up else "down", target,
+            switch.name, switch.ip, reason,
+        )
+        snmp_target = await UdpTransportTarget.create(
+            (switch.ip, switch.snmp_port), timeout=5, retries=1
+        )
+        error_indication, error_status, error_index, var_binds = await set_cmd(
+            self._engine,
+            self._usm(),
+            snmp_target,
+            ContextData(),
+            ObjectType(ObjectIdentity(oid), Integer(target)),
+        )
+        if error_indication or error_status:
+            detail = error_indication or error_status.prettyPrint()
+            log.error("manual %s SET failed switch=%s ifindex=%d: %s",
+                      verb, switch.name, ifindex, detail)
+            await self._notify(kind, switch, ifindex,
+                               f"{reason}; SET failed: {detail}", verified=False)
+            return False
+        got = await self._read_admin_status(switch, ifindex, oid)
+        ok = got == target
+        if ok:
+            log.warning("CONFIRMED manual %s: ifAdminStatus.%d = %s on switch=%s",
+                        verb, ifindex, "up" if target_up else "down", switch.name)
+        else:
+            log.error("manual %s NOT confirmed switch=%s ifindex=%d (read back %s)",
+                      verb, switch.name, ifindex, got)
+        await self._notify(kind, switch, ifindex, reason, verified=ok)
         return ok
 
     async def _read_admin_status(self, switch: SwitchConfig, ifindex: int, oid: str) -> int | None:

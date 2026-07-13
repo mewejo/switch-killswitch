@@ -28,20 +28,36 @@ async def run(config_path: str | None) -> None:
     )
     notifier = Notifier(cfg)
     actor = PortShutdownActor(cfg, notifier)
-    poller = LinkPoller(cfg, actor)
+
+    controller = None
+    if cfg.mqtt_control is not None:
+        from .ha_control import HAController
+        controller = HAController(cfg, actor)
+
+    poller = LinkPoller(cfg, actor, state_sink=controller.on_port_state if controller else None)
     poller.start()
+    if controller is not None:
+        await controller.start()
     log = logging.getLogger("killswitch")
     log.info(
         "notification channels: %s",
         ", ".join(notifier.channels) or "none configured",
+    )
+    log.info(
+        "home assistant control (mqtt): %s",
+        "enabled" if controller is not None else "disabled",
     )
     for sw in cfg.switches.values():
         log.info(
             "armed: switch=%s ip=%s ports(ifindex)=%s debounce=%.0fs",
             sw.name, sw.ip, sorted(sw.allowed_ifindexes), sw.debounce_seconds,
         )
-    log.info("ports are never auto re-enabled; re-enable manually on the switch")
-    await asyncio.Event().wait()  # run forever
+    log.info("ports are never auto re-enabled; re-enable manually on the switch or via Home Assistant")
+    try:
+        await asyncio.Event().wait()  # run forever
+    finally:
+        if controller is not None:
+            controller.stop()
 
 
 def main() -> None:

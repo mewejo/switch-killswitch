@@ -1,3 +1,4 @@
 pysnmp>=7.1,<8
 pyyaml>=6
 cryptography>=42
+paho-mqtt>=2,<3
