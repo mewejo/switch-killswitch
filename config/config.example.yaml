@@ -47,6 +47,25 @@ notifications:
     token_env: "HA_TOKEN"
     event_type: "${HA_EVENT_TYPE:-switch_killswitch}"
 
+# Home Assistant control surface over MQTT. Publishes an MQTT-discovery switch
+# entity per watched port so its state is visible in HA and can be toggled
+# (re-enable a killed port, or shut one on demand) from the dashboard. The
+# connection to the broker is outbound-only — no inbound port is opened — and
+# every toggle is announced as port_restored/port_disabled so manual changes
+# stay auditable. Set both allow_* to false for a visibility-only entity.
+mqtt_control:
+  enabled: "${MQTT_ENABLED:-false}"
+  host: "${MQTT_HOST:-homeassistant.local}"
+  port: "${MQTT_PORT:-1883}"
+  username: "${MQTT_USERNAME:-}"
+  password_env: "MQTT_PASSWORD"
+  tls: "${MQTT_TLS:-false}"
+  discovery_prefix: "${MQTT_DISCOVERY_PREFIX:-homeassistant}"
+  base_topic: "${MQTT_BASE_TOPIC:-switch_killswitch}"
+  device_name: "${MQTT_DEVICE_NAME:-Switch Killswitch}"
+  allow_reenable: "${MQTT_ALLOW_REENABLE:-true}"
+  allow_disable: "${MQTT_ALLOW_DISABLE:-true}"
+
 switches:
   - name: "switch-1"
     ip: "192.0.2.10"

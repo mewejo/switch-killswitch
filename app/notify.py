@@ -1,9 +1,11 @@
 """Notification engine: email (SMTP) and Home Assistant (event bus).
 
 Events emitted by the actor:
-  port_killed  — ifAdminStatus confirmed down after a kill
-  kill_failed  — SET failed/rejected or read-back verification mismatched
-  rate_limited — global rate limit refused an action (possible storm/abuse)
+  port_killed   — ifAdminStatus confirmed down after a kill
+  kill_failed   — SET failed/rejected or read-back verification mismatched
+  rate_limited  — global rate limit refused an action (possible storm/abuse)
+  port_restored — a port was deliberately re-enabled (e.g. Home Assistant toggle)
+  port_disabled — a port was deliberately disabled on demand (not a link-loss kill)
 
 Design constraints:
   - Notification failure must never block or break the kill path: every
@@ -86,6 +88,8 @@ class Notifier:
             "port_killed": "port {ifindex} KILLED on {switch}",
             "kill_failed": "FAILED to kill port {ifindex} on {switch}",
             "rate_limited": "rate limit hit — kill refused for port {ifindex} on {switch}",
+            "port_restored": "port {ifindex} RE-ENABLED on {switch}",
+            "port_disabled": "port {ifindex} manually disabled on {switch}",
         }.get(event["event"], "{event} on {switch}").format(**event)
         msg["Subject"] = f"{cfg.subject_prefix} {headline}"
         msg["From"] = cfg.sender

@@ -34,9 +34,11 @@ EdgeSwitch / Broadcom FASTPATH — extra field notes for that family live in
    read-back to verify it actually took. Actions are debounced per port and
    rate-limited globally, so a misbehaving switch can't trigger a storm.
 
-3. **Stay killed.** The service never re-enables a port — that's a manual
-   action, done on the switch, by a human. A port that is already down when
-   the service starts is treated as baseline and never retro-killed.
+3. **Stay killed.** The service never re-enables a port *on its own* —
+   bringing one back is always a deliberate human action, whether on the
+   switch or via the optional [Home Assistant toggle](#see-and-re-enable-ports-from-home-assistant).
+   A port that is already down when the service starts is treated as baseline
+   and never retro-killed.
 
 ### The arming delay (why a re-enabled port isn't instantly re-killed)
 
@@ -127,6 +129,8 @@ Three events can fire:
 | `port_killed` | A port was shut and the read-back confirmed it |
 | `kill_failed` | The SET was rejected, or the read-back didn't match |
 | `rate_limited` | The storm guard refused an action |
+| `port_restored` | A port was deliberately re-enabled (e.g. from Home Assistant) |
+| `port_disabled` | A port was deliberately shut on demand (not a link-loss kill) |
 
 Notification failures are logged and never block the kill path.
 
@@ -151,10 +155,59 @@ Notification failures are logged and never block the kill path.
           {{ trigger.event.data.switch }} ({{ trigger.event.data.reason }})
   ```
 
+## See and re-enable ports from Home Assistant
+
+The event integration above is one-way. If you also want to **see** each
+watched port and **re-enable** a killed one without opening a switch console,
+turn on the MQTT control surface. Each watched port shows up in Home Assistant
+as a discovered **switch entity** you can glance at and toggle:
+
+- **On** = the port is administratively up; **off** = it's been shut (killed).
+- Toggling it back **on** re-enables the port (an SNMP SET, verified by
+  read-back); toggling **off** shuts it on demand.
+- The entity's attributes show whether a cable is actually linked
+  (`link_status`), so you can tell "re-enabled but still unplugged" apart from
+  "up and connected".
+
+It stays true to the rest of the service: the connection to your broker is
+**outbound-only** (no inbound port is opened), and the service still *never*
+re-enables a port on its own — the toggle is a deliberate action you take.
+Every toggle is announced through the notifier (`port_restored` /
+`port_disabled`), so manual re-enables are audited right alongside kills.
+
+Enable it (you need an MQTT broker Home Assistant also uses — e.g. the
+Mosquitto add-on):
+
+```
+MQTT_ENABLED=true
+MQTT_HOST=homeassistant.local      # your broker
+MQTT_USERNAME=killswitch           # optional; MQTT_PASSWORD alongside
+```
+
+The entities appear automatically via MQTT discovery — no HA YAML needed. See
+`.env.example` for the rest (TLS, topic/discovery prefixes, device name). For a
+**visibility-only** entity that can't re-enable anything, set both
+`MQTT_ALLOW_REENABLE=false` and `MQTT_ALLOW_DISABLE=false`. Because re-enabling
+a killed port is a security-relevant action, put the broker behind
+authentication (and ideally TLS), and restrict who can publish to the command
+topics.
+
+**Running [redundant instances](#redundancy)?** Enable this on one of them —
+the primary. Unlike the kill path, the HA surface is a visibility/control
+convenience, not the safety-critical function, so it doesn't need N-way
+redundancy: a single owner keeps the entity's availability clean if one host
+goes down (the killswitch itself stays redundant regardless). It degrades
+gracefully if you *do* enable it on several — each instance gets a distinct
+client id (`switch-killswitch-<hostname>` by default, overridable with
+`MQTT_CLIENT_ID`), and a toggle broadcast to all of them is deduplicated with
+the same `KILL_DELAY` stand-down as a kill, so only one instance actually
+acts and notifies.
+
 ## Testing
 
-Full local end-to-end proof — a fake SNMPv3 switch agent, an SMTP sink, and a
-fake Home Assistant API; no hardware needed:
+Full local end-to-end proof — a fake SNMPv3 switch agent, an SMTP sink, a fake
+Home Assistant API, and a fake MQTT broker (which proves an HA toggle really
+re-enables a killed port); no hardware needed:
 
 ```
 .venv/bin/python -m tests.prove_theory

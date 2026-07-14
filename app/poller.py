@@ -35,6 +35,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from pysnmp.hlapi.v3arch.asyncio import (
     ContextData,
@@ -51,10 +52,16 @@ from .config import Config, SwitchConfig
 
 log = logging.getLogger("killswitch.poller")
 
+IF_ADMIN_STATUS = "1.3.6.1.2.1.2.2.1.7"
 IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8"
 IF_LAST_CHANGE = "1.3.6.1.2.1.2.2.1.9"
 UP = 1
 DOWN_STATES = {2, 7}  # down, lowerLayerDown
+
+# Reports (switch, ifindex, oper_status, admin_status|None, last_change) each
+# poll. Purely for surfacing state (e.g. the Home Assistant MQTT entity);
+# link-down detection uses only oper/last_change.
+StateSink = Callable[[SwitchConfig, int, int, int | None, int], None]
 
 
 @dataclass
@@ -66,9 +73,13 @@ class PortState:
 
 
 class LinkPoller:
-    def __init__(self, cfg: Config, actor: PortShutdownActor) -> None:
+    def __init__(self, cfg: Config, actor: PortShutdownActor,
+                 state_sink: StateSink | None = None) -> None:
         self._cfg = cfg
         self._actor = actor
+        # Optional observer of per-port status, read alongside link state each
+        # poll. When set, ifAdminStatus is polled too so the sink sees it.
+        self._state_sink = state_sink
         self._engine = SnmpEngine()
         self._state: dict[tuple[str, int], PortState] = {}
         self._tasks: list[asyncio.Task] = []
@@ -92,6 +103,10 @@ class LinkPoller:
         ifindexes = sorted(switch.allowed_ifindexes)
         oids = [ObjectType(ObjectIdentity(f"{IF_OPER_STATUS}.{i}")) for i in ifindexes]
         oids += [ObjectType(ObjectIdentity(f"{IF_LAST_CHANGE}.{i}")) for i in ifindexes]
+        # Only read ifAdminStatus when someone is watching (keeps the default
+        # detection GET, and its VACM view, byte-for-byte unchanged).
+        if self._state_sink is not None:
+            oids += [ObjectType(ObjectIdentity(f"{IF_ADMIN_STATUS}.{i}")) for i in ifindexes]
         fail_streak = 0
         while True:
             try:
@@ -128,6 +143,12 @@ class LinkPoller:
                     "unparseable poll values for switch=%s ifindex=%d", switch.name, ifindex
                 )
                 continue
+            admin = None
+            if self._state_sink is not None:
+                try:
+                    admin = int(var_binds[2 * n + pos][1])
+                except (ValueError, TypeError, IndexError):
+                    admin = None  # reporting is best-effort; detection is unaffected
             key = (switch.ip, ifindex)
             state = self._state.get(key)
             if state is None:
@@ -135,10 +156,15 @@ class LinkPoller:
                     oper, last_change, up_since=now if oper == UP else None
                 )
                 log.info("baseline switch=%s ifindex=%d oper=%d", switch.name, ifindex, oper)
-                continue
-            self._transition(switch, ifindex, state, oper, last_change, now)
-            state.oper = oper
-            state.last_change = last_change
+            else:
+                self._transition(switch, ifindex, state, oper, last_change, now)
+                state.oper = oper
+                state.last_change = last_change
+            if self._state_sink is not None:
+                try:
+                    self._state_sink(switch, ifindex, oper, admin, last_change)
+                except Exception:
+                    log.exception("state sink failed switch=%s ifindex=%d", switch.name, ifindex)
 
     def _transition(self, switch: SwitchConfig, ifindex: int, state: PortState,
                     oper: int, last_change: int, now: float) -> None:

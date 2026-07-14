@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 
 import yaml
@@ -108,6 +109,38 @@ class HomeAssistantConfig:
 
 
 @dataclass(frozen=True)
+class MqttControlConfig:
+    """Home Assistant control surface over MQTT.
+
+    Publishes an MQTT-discovery `switch` entity per watched port so the port's
+    state is visible in HA and can be toggled (re-enabled/disabled) from there.
+    Connection to the broker is outbound-only, like every other channel here —
+    no inbound port is opened.
+    """
+    host: str
+    port: int = 1883
+    username: str = ""
+    password: str = ""
+    tls: bool = False
+    keepalive: int = 60
+    # MQTT requires a unique client id per connection — a broker force-kicks any
+    # existing client that reconnects with the same id. Left unset, this is
+    # derived per host so multiple redundant instances don't fight (see
+    # _load_mqtt_control). Pin it explicitly if you run several on one host.
+    client_id: str = "switch-killswitch"
+    discovery_prefix: str = "homeassistant"
+    base_topic: str = "switch_killswitch"
+    device_id: str = "switch_killswitch"
+    device_name: str = "Switch Killswitch"
+    retain: bool = True
+    # A killed port is a security event; re-enabling it from HA is a deliberate
+    # human action. Either direction of the toggle can be withheld: leave both
+    # off for a visibility-only (read-only) entity.
+    allow_reenable: bool = True
+    allow_disable: bool = True
+
+
+@dataclass(frozen=True)
 class NotificationsConfig:
     email: EmailConfig | None = None
     home_assistant: HomeAssistantConfig | None = None
@@ -132,6 +165,8 @@ class Config:
     standby_delay: float = 0.0
     rate_limit: RateLimit = field(default_factory=RateLimit)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    # Optional Home Assistant control surface over MQTT (see/toggle ports).
+    mqtt_control: MqttControlConfig | None = None
 
 
 def _as_bool(value) -> bool:
@@ -177,6 +212,45 @@ def _load_home_assistant(raw: dict) -> HomeAssistantConfig | None:
         base_url=base_url,
         token=_read_secret(raw, "token"),
         event_type=str(raw.get("event_type", "switch_killswitch")),
+    )
+
+
+def _load_mqtt_control(raw: dict) -> MqttControlConfig | None:
+    if not _as_bool(raw.get("enabled")):
+        return None
+    host = str(raw.get("host", ""))
+    if not host:
+        raise ConfigError("mqtt_control: host is required when enabled")
+    username = str(raw.get("username", "") or "")
+    # Password is optional (anonymous brokers exist); only read as a secret
+    # when a username is set, and allow it to be short/empty for local brokers.
+    password = ""
+    if username:
+        password = (
+            _read_secret(raw, "password")
+            if (raw.get("password_file") or raw.get("password_env") or raw.get("password"))
+            else ""
+        )
+    # Default to a per-host client id so redundant instances on different hosts
+    # don't collide (an MQTT broker force-disconnects a duplicate client id).
+    client_id = str(raw.get("client_id") or "").strip()
+    if not client_id:
+        client_id = f"switch-killswitch-{socket.gethostname()}"
+    return MqttControlConfig(
+        host=host,
+        port=int(raw.get("port", 1883)),
+        username=username,
+        password=password,
+        tls=_as_bool(raw.get("tls")),
+        keepalive=int(raw.get("keepalive", 60)),
+        client_id=client_id,
+        discovery_prefix=str(raw.get("discovery_prefix", "homeassistant")).rstrip("/"),
+        base_topic=str(raw.get("base_topic", "switch_killswitch")).rstrip("/"),
+        device_id=str(raw.get("device_id", "switch_killswitch")),
+        device_name=str(raw.get("device_name", "Switch Killswitch")),
+        retain=_as_bool(raw.get("retain", True)),
+        allow_reenable=_as_bool(raw.get("allow_reenable", True)),
+        allow_disable=_as_bool(raw.get("allow_disable", True)),
     )
 
 
@@ -254,6 +328,23 @@ def load_config_from_env() -> Config:
                 "token_env": "HA_TOKEN",
                 "event_type": env.get("HA_EVENT_TYPE", "switch_killswitch"),
             },
+        },
+        "mqtt_control": {
+            "enabled": env.get("MQTT_ENABLED", "false"),
+            "host": env.get("MQTT_HOST", ""),
+            "port": env.get("MQTT_PORT", 1883),
+            "username": env.get("MQTT_USERNAME", ""),
+            "password_env": "MQTT_PASSWORD",
+            "tls": env.get("MQTT_TLS", "false"),
+            "keepalive": env.get("MQTT_KEEPALIVE", 60),
+            "client_id": env.get("MQTT_CLIENT_ID", ""),  # blank -> per-host default
+            "discovery_prefix": env.get("MQTT_DISCOVERY_PREFIX", "homeassistant"),
+            "base_topic": env.get("MQTT_BASE_TOPIC", "switch_killswitch"),
+            "device_id": env.get("MQTT_DEVICE_ID", "switch_killswitch"),
+            "device_name": env.get("MQTT_DEVICE_NAME", "Switch Killswitch"),
+            "retain": env.get("MQTT_RETAIN", "true"),
+            "allow_reenable": env.get("MQTT_ALLOW_REENABLE", "true"),
+            "allow_disable": env.get("MQTT_ALLOW_DISABLE", "true"),
         },
         "switches": switches,
     }
@@ -338,6 +429,8 @@ def _build_config(raw: dict) -> Config:
         home_assistant=_load_home_assistant(notif_raw.get("home_assistant") or {}),
     )
 
+    mqtt_control = _load_mqtt_control(raw.get("mqtt_control") or {})
+
     return Config(
         snmp=creds,
         switches=switches,
@@ -347,4 +440,5 @@ def _build_config(raw: dict) -> Config:
         standby_delay=standby_delay,
         rate_limit=rate_limit,
         notifications=notifications,
+        mqtt_control=mqtt_control,
     )

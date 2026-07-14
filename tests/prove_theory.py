@@ -3,6 +3,7 @@
 Topology:
   [fake switch agent :10161]  <--SNMPv3 GET (poll) / SET (kill)--  [service]
   [SMTP sink :10250] and [fake Home Assistant API :10251]  <--notifications--
+  [fake MQTT broker :10252]  <--discovery + state / toggle commands--
 
 The fake agent exposes ifOperStatus/ifLastChange (read) and a writable
 ifAdminStatus for port 24. The harness manipulates the fake port's state
@@ -14,6 +15,8 @@ Scenarios:
   2. repeat drop within debounce window -> suppressed, still exactly one action
   3. already-down port at baseline      -> covered by startup (port starts up; implicit)
   4. flap: oper stays up but ifLastChange moves -> kill fires (fast-replug defence)
+  M. Home Assistant MQTT control: discovery entity published, live state
+     tracks a kill, and an HA "ON" command re-enables the port (audited)
 
 Run:  .venv/bin/python -m tests.prove_theory
 """
@@ -36,6 +39,7 @@ from pysnmp.proto.rfc1902 import Integer, TimeTicks
 
 from app.actor import PortShutdownActor
 from app.config import load_config, load_config_from_env
+from app.ha_control import HAController
 from app.notify import Notifier
 from app.poller import LinkPoller
 
@@ -45,6 +49,7 @@ PRIV_PASS = "privpass-1234"
 AGENT_PORT = 10161
 SMTP_PORT = 10250
 HA_PORT = 10251
+MQTT_PORT = 10252
 HA_TOKEN = "test-ha-token-1234"
 POLL_INTERVAL = 0.3
 DEBOUNCE = 6.0  # must exceed the settle sleeps between scenarios 1 and 2
@@ -125,6 +130,108 @@ class FakeHomeAssistant:
                      + payload)
         await writer.drain()
         writer.close()
+
+
+class FakeMqttBroker:
+    """Minimal MQTT 3.1.1 broker — just enough for paho-mqtt to connect,
+    subscribe, publish (QoS 0/1), and receive broker-pushed commands.
+
+    Records published messages (so the harness can assert discovery/state) and
+    can push a PUBLISH to subscribers (so the harness can play Home Assistant
+    sending a toggle command).
+    """
+
+    def __init__(self) -> None:
+        self.published: dict[str, bytes] = {}          # topic -> last payload
+        self.messages: list[tuple[str, bytes]] = []    # every publish, in order
+        self.subscriptions: list[tuple[str, object]] = []  # (topic, writer)
+
+    async def serve(self) -> None:
+        await asyncio.start_server(self._handle, "127.0.0.1", MQTT_PORT)
+
+    @staticmethod
+    def _encode_len(n: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = n % 128
+            n //= 128
+            if n > 0:
+                byte |= 0x80
+            out.append(byte)
+            if n == 0:
+                return bytes(out)
+
+    @staticmethod
+    async def _read_len(reader) -> int:
+        multiplier = 1
+        value = 0
+        while True:
+            byte = (await reader.readexactly(1))[0]
+            value += (byte & 0x7F) * multiplier
+            if not byte & 0x80:
+                return value
+            multiplier *= 128
+
+    async def _handle(self, reader, writer) -> None:
+        try:
+            while True:
+                header = (await reader.readexactly(1))[0]
+                ptype, flags = header & 0xF0, header & 0x0F
+                remaining = await self._read_len(reader)
+                body = await reader.readexactly(remaining) if remaining else b""
+                if ptype == 0x10:        # CONNECT
+                    writer.write(bytes([0x20, 0x02, 0x00, 0x00]))       # CONNACK
+                elif ptype == 0x30:      # PUBLISH from client
+                    qos = (flags & 0x06) >> 1
+                    tlen = int.from_bytes(body[0:2], "big")
+                    topic = body[2:2 + tlen].decode()
+                    rest = body[2 + tlen:]
+                    if qos > 0:
+                        pid, payload = rest[0:2], rest[2:]
+                        writer.write(bytes([0x40, 0x02]) + pid)         # PUBACK
+                    else:
+                        payload = rest
+                    self.published[topic] = payload
+                    self.messages.append((topic, payload))
+                elif ptype == 0x80:      # SUBSCRIBE
+                    pid, rest, i = body[0:2], body[2:], 0
+                    count = 0
+                    while i < len(rest):
+                        flen = int.from_bytes(rest[i:i + 2], "big"); i += 2
+                        topic = rest[i:i + flen].decode(); i += flen
+                        i += 1  # requested QoS byte
+                        self.subscriptions.append((topic, writer))
+                        count += 1
+                    writer.write(bytes([0x90]) + self._encode_len(2 + count)
+                                 + pid + bytes([0x00] * count))          # SUBACK
+                elif ptype == 0xC0:      # PINGREQ
+                    writer.write(bytes([0xD0, 0x00]))                    # PINGRESP
+                elif ptype == 0xE0:      # DISCONNECT
+                    break
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            self.subscriptions = [(t, w) for (t, w) in self.subscriptions if w is not writer]
+            writer.close()
+
+    async def wait_for_subscription(self, topic: str, timeout: float = 5.0) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if any(t == topic for t, _ in self.subscriptions):
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    async def publish_to_subscribers(self, topic: str, payload: bytes) -> None:
+        """Push a QoS-0 PUBLISH to every subscriber of `topic` (plays HA)."""
+        tb = topic.encode()
+        var = len(tb).to_bytes(2, "big") + tb + payload
+        packet = bytes([0x30]) + self._encode_len(len(var)) + var
+        for filt, writer in list(self.subscriptions):
+            if filt == topic:
+                writer.write(packet)
+                await writer.drain()
 
 
 # --------------------------------------------------------------------------
@@ -282,8 +389,10 @@ async def main() -> int:
 
     smtp_sink = SmtpSink()
     ha = FakeHomeAssistant()
+    broker = FakeMqttBroker()
     await smtp_sink.serve()
     await ha.serve()
+    await broker.serve()
 
     port = start_fake_switch_agent()
     cfg = load_config(str(config_path))
@@ -434,6 +543,136 @@ async def main() -> int:
         and env_cfg.notifications.email.recipients == ("a@test.local", "b@test.local")
         and env_cfg.notifications.home_assistant is None,
         f"(switches={list(env_cfg.switches)})",
+    )
+
+    # --- Scenario M: Home Assistant control over MQTT ---
+    log.info("=== scenario M: home assistant MQTT control (see + toggle) ===")
+    ha_events_before = len(ha.events)
+    mqtt_cfg_text = f"""
+snmp:
+  user: "{USER}"
+  auth_protocol: "SHA"
+  auth_password_file: "{tmp / 'auth'}"
+  priv_protocol: "DES"
+  priv_password_file: "{tmp / 'priv'}"
+poll:
+  interval_seconds: {POLL_INTERVAL}
+  arm_delay_seconds: 0
+notifications:
+  home_assistant:
+    enabled: true
+    base_url: "http://127.0.0.1:{HA_PORT}"
+    token_file: "{tmp / 'ha_token'}"
+mqtt_control:
+  enabled: true
+  host: "127.0.0.1"
+  port: {MQTT_PORT}
+  base_topic: "switch_killswitch"
+  discovery_prefix: "homeassistant"
+switches:
+  - name: "fake-switch"
+    ip: "127.0.0.1"
+    snmp_port: {AGENT_PORT}
+    allowed_ifindexes: [28]
+    debounce_seconds: 2
+"""
+    (tmp / "mqtt_config.yaml").write_text(mqtt_cfg_text)
+    mqtt_agent_port = add_fake_port(28)
+    mqtt_cfg = load_config(str(tmp / "mqtt_config.yaml"))
+    mqtt_actor = PortShutdownActor(mqtt_cfg, Notifier(mqtt_cfg))
+    controller = HAController(mqtt_cfg, mqtt_actor)
+    mqtt_poller = LinkPoller(mqtt_cfg, mqtt_actor, state_sink=controller.on_port_state)
+    mqtt_poller.start()
+    await controller.start()
+
+    entity = controller._port_for("127.0.0.1", 28)
+    subscribed = await broker.wait_for_subscription(entity.command_topic, timeout=5)
+    await settle()
+
+    check(
+        "MQTT discovery entity published with a command topic",
+        entity.discovery_topic in broker.published
+        and b'"command_topic"' in broker.published[entity.discovery_topic]
+        and b"switch_killswitch/127_0_0_1/28/set" in broker.published[entity.discovery_topic],
+        f"(config_topics={[t for t in broker.published if t.endswith('/config')]})",
+    )
+    check(
+        "MQTT state shows the port up (ON) at baseline",
+        subscribed and broker.published.get(entity.state_topic) == b"ON",
+        f"(subscribed={subscribed}, state={broker.published.get(entity.state_topic)})",
+    )
+
+    # A kill must be reflected in the entity's state.
+    mqtt_agent_port.set_link(up=False)
+    await settle()
+    check(
+        "MQTT state tracks the kill (OFF)",
+        int(mqtt_agent_port.admin.syntax) == 2
+        and broker.published.get(entity.state_topic) == b"OFF",
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"state={broker.published.get(entity.state_topic)})",
+    )
+
+    # Home Assistant sends "ON" -> the killed port is re-enabled...
+    await broker.publish_to_subscribers(entity.command_topic, b"ON")
+    await settle()
+    check(
+        "HA 'ON' command re-enables the killed port",
+        int(mqtt_agent_port.admin.syntax) == 1
+        and broker.published.get(entity.state_topic) == b"ON",
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"state={broker.published.get(entity.state_topic)})",
+    )
+    # ...and that manual re-enable is audited like any other action.
+    restored = [e for _, e in ha.events[ha_events_before:]
+                if e.get("event") == "port_restored" and e.get("ifindex") == 28]
+    check(
+        "manual re-enable is audited (port_restored event, verified)",
+        len(restored) >= 1 and restored[-1].get("verified") is True,
+        f"(restored_events={restored})",
+    )
+
+    # A malformed command must NOT disable the port (no silent fall-through to OFF).
+    await broker.publish_to_subscribers(entity.command_topic, b"garbage")
+    await settle()
+    check(
+        "malformed MQTT command is ignored (port not disabled)",
+        int(mqtt_agent_port.admin.syntax) == 1
+        and broker.published.get(entity.state_topic) == b"ON",
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"state={broker.published.get(entity.state_topic)})",
+    )
+    controller.stop()
+
+    # --- Scenario MR: a broadcast HA toggle is redundancy-safe ---
+    # An MQTT toggle reaches every instance; only one should act. A primary
+    # (standby_delay 0) and a standby (standby_delay > 0) both re-enable the
+    # same killed port concurrently -> one SET, one port_restored notification.
+    log.info("=== scenario MR: HA toggle across redundant instances ===")
+    standby_text = mqtt_cfg_text.replace(
+        "poll:", "redundancy:\n  standby_delay_seconds: 1.5\npoll:", 1
+    )
+    (tmp / "mqtt_standby.yaml").write_text(standby_text)
+    standby_cfg = load_config(str(tmp / "mqtt_standby.yaml"))
+    standby_actor = PortShutdownActor(standby_cfg, Notifier(standby_cfg))
+    primary_sw = mqtt_cfg.switches["127.0.0.1"]        # mqtt_actor: standby_delay 0
+    standby_sw = standby_cfg.switches["127.0.0.1"]
+    mqtt_agent_port.set_link(up=False)
+    mqtt_agent_port.admin.syntax = Integer(2)          # start from a killed port
+    restored_before = sum(1 for _, e in ha.events
+                          if e.get("event") == "port_restored" and e.get("ifindex") == 28)
+    await asyncio.gather(
+        mqtt_actor.set_admin(primary_sw, 28, True, reason="ha toggle"),
+        standby_actor.set_admin(standby_sw, 28, True, reason="ha toggle"),
+    )
+    await asyncio.sleep(0.4)  # let the single notification flush
+    restored_after = sum(1 for _, e in ha.events
+                         if e.get("event") == "port_restored" and e.get("ifindex") == 28)
+    check(
+        "redundant instances dedupe a toggle (one SET, one notification)",
+        int(mqtt_agent_port.admin.syntax) == 1 and (restored_after - restored_before) == 1,
+        f"(admin={int(mqtt_agent_port.admin.syntax)}, "
+        f"restored_delta={restored_after - restored_before})",
     )
 
     failed = [n for n, ok in CHECKS if not ok]
