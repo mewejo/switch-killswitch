@@ -146,12 +146,19 @@ class HAController:
         if self._client is None:
             return
         try:
-            info = self._client.publish(self._availability_topic, AVAIL_OFFLINE,
-                                        qos=1, retain=True)
-            try:
-                info.wait_for_publish(1.0)  # flush before we cut the connection
-            except (ValueError, RuntimeError):
-                pass
+            # Only mark the entity unavailable when we solely own it. In cluster
+            # mode the shared availability topic is asserted online by whichever
+            # instance is master; a stopping standby must not flip it offline
+            # while the master still serves, and a stopping master must not race
+            # its successor's takeover. Total cluster loss is surfaced instead by
+            # the cluster status sensor (expire_after).
+            if not self._clustered:
+                info = self._client.publish(self._availability_topic, AVAIL_OFFLINE,
+                                            qos=1, retain=True)
+                try:
+                    info.wait_for_publish(1.0)  # flush before we cut the connection
+                except (ValueError, RuntimeError):
+                    pass
             # disconnect() before loop_stop() is paho's supported shutdown order.
             self._client.disconnect()
             self._client.loop_stop()

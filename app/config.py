@@ -414,7 +414,10 @@ def load_config_from_env() -> Config:
             "host": env.get("MQTT_HOST", ""),
             "port": env.get("MQTT_PORT", 1883),
             "username": env.get("MQTT_USERNAME", ""),
-            "password_env": "MQTT_PASSWORD",
+            # Only reference the password var when it is actually set, so a
+            # username with no password stays valid (some brokers auth on
+            # username alone) rather than tripping the required-secret read.
+            "password_env": "MQTT_PASSWORD" if env.get("MQTT_PASSWORD") else "",
             "tls": env.get("MQTT_TLS", "false"),
             "keepalive": env.get("MQTT_KEEPALIVE", 60),
             "client_id": env.get("MQTT_CLIENT_ID", ""),  # blank -> per-host default
@@ -433,7 +436,11 @@ def load_config_from_env() -> Config:
             "host": env.get("CLUSTER_MQTT_HOST", env.get("MQTT_HOST", "")),
             "port": env.get("CLUSTER_MQTT_PORT", env.get("MQTT_PORT", 1883)),
             "username": env.get("CLUSTER_MQTT_USERNAME", env.get("MQTT_USERNAME", "")),
-            "password_env": "CLUSTER_MQTT_PASSWORD" if env.get("CLUSTER_MQTT_PASSWORD") else "MQTT_PASSWORD",
+            # Only point at a password var that is actually set, so a username
+            # with no password (anonymous-ish broker) stays valid instead of
+            # tripping the required-secret read in _load_cluster.
+            "password_env": ("CLUSTER_MQTT_PASSWORD" if env.get("CLUSTER_MQTT_PASSWORD")
+                             else "MQTT_PASSWORD" if env.get("MQTT_PASSWORD") else ""),
             "tls": env.get("CLUSTER_MQTT_TLS", env.get("MQTT_TLS", "false")),
             "node_id": env.get("CLUSTER_NODE_ID", ""),
             "priority": env.get("CLUSTER_PRIORITY", 100),
