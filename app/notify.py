@@ -45,6 +45,34 @@ def make_event(kind: str, switch_name: str, switch_ip: str, ifindex: int,
     return event
 
 
+def make_cluster_event(kind: str, node: str, peer: str | None = None,
+                       master: str | None = None, online: list[str] | None = None,
+                       expected: int | None = None, degraded: bool = False) -> dict:
+    """Build a cluster-membership event (peer_up/peer_down/role changes).
+
+    Node-oriented rather than port-oriented, but goes through the same channels
+    as a kill so redundancy changes land in the same inbox as security events.
+    """
+    return {
+        "event": kind,
+        "node": node,
+        "peer": peer or "",
+        "master": master or "",
+        "online": online or [],
+        "online_count": len(online or []),
+        "expected": expected,
+        "degraded": degraded,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class _SafeDict(dict):
+    """Formatting helper: an unknown {field} renders as '?' instead of raising."""
+
+    def __missing__(self, key: str) -> str:
+        return "?"
+
+
 class Notifier:
     def __init__(self, cfg: Config) -> None:
         self._email = cfg.notifications.email
@@ -90,7 +118,11 @@ class Notifier:
             "rate_limited": "rate limit hit — kill refused for port {ifindex} on {switch}",
             "port_restored": "port {ifindex} RE-ENABLED on {switch}",
             "port_disabled": "port {ifindex} manually disabled on {switch}",
-        }.get(event["event"], "{event} on {switch}").format(**event)
+            "peer_down": "peer {peer} is DOWN — redundancy degraded (online: {online_count})",
+            "peer_up": "peer {peer} is back UP (online: {online_count})",
+            "became_master": "node {node} is now MASTER of the killswitch cluster",
+            "resigned_master": "node {node} handed master to {peer}",
+        }.get(event["event"], "{event}").format_map(_SafeDict(event))
         msg["Subject"] = f"{cfg.subject_prefix} {headline}"
         msg["From"] = cfg.sender
         msg["To"] = ", ".join(cfg.recipients)

@@ -17,6 +17,10 @@ Scenarios:
   4. flap: oper stays up but ifLastChange moves -> kill fires (fast-replug defence)
   M. Home Assistant MQTT control: discovery entity published, live state
      tracks a kill, and an HA "ON" command re-enables the port (audited)
+  C. Cluster: two instances elect a master by lowest priority, the standby is
+     promoted when the master leaves, and the survivor raises a peer_down alert
+  CH. The elected master owns the HA control surface (passive until master,
+     takes over on promotion, releases on demotion)
 
 Run:  .venv/bin/python -m tests.prove_theory
 """
@@ -38,7 +42,8 @@ from pysnmp.entity.rfc3413 import cmdrsp, context
 from pysnmp.proto.rfc1902 import Integer, TimeTicks
 
 from app.actor import PortShutdownActor
-from app.config import load_config, load_config_from_env
+from app.cluster import Cluster
+from app.config import ClusterConfig, load_config, load_config_from_env
 from app.ha_control import HAController
 from app.notify import Notifier
 from app.poller import LinkPoller
@@ -144,10 +149,69 @@ class FakeMqttBroker:
     def __init__(self) -> None:
         self.published: dict[str, bytes] = {}          # topic -> last payload
         self.messages: list[tuple[str, bytes]] = []    # every publish, in order
-        self.subscriptions: list[tuple[str, object]] = []  # (topic, writer)
+        self.subscriptions: list[tuple[str, object]] = []  # (filter, writer)
+        self.retained: dict[str, bytes] = {}           # topic -> retained payload
 
     async def serve(self) -> None:
         await asyncio.start_server(self._handle, "127.0.0.1", MQTT_PORT)
+
+    @staticmethod
+    def _topic_matches(filt: str, topic: str) -> bool:
+        f, t = filt.split("/"), topic.split("/")
+        for i, part in enumerate(f):
+            if part == "#":
+                return True
+            if i >= len(t):
+                return False
+            if part == "+":
+                continue
+            if part != t[i]:
+                return False
+        return len(f) == len(t)
+
+    @staticmethod
+    def _parse_connect(body: bytes):
+        """Return (client_id, will|None) from a CONNECT packet body."""
+        try:
+            i = 0
+            nlen = int.from_bytes(body[i:i + 2], "big"); i += 2 + nlen  # protocol name
+            i += 1                                                       # protocol level
+            flags = body[i]; i += 1
+            i += 2                                                       # keepalive
+            clen = int.from_bytes(body[i:i + 2], "big"); i += 2
+            client_id = body[i:i + clen].decode(errors="replace"); i += clen
+            will = None
+            if flags & 0x04:  # will flag
+                tlen = int.from_bytes(body[i:i + 2], "big"); i += 2
+                wtopic = body[i:i + tlen].decode(errors="replace"); i += tlen
+                mlen = int.from_bytes(body[i:i + 2], "big"); i += 2
+                wpayload = body[i:i + mlen]; i += mlen
+                will = (wtopic, wpayload, bool(flags & 0x20))  # topic, payload, retain
+            return client_id, will
+        except Exception:
+            return "", None
+
+    def _publish_packet(self, topic: str, payload: bytes) -> bytes:
+        tb = topic.encode()
+        var = len(tb).to_bytes(2, "big") + tb + payload
+        return bytes([0x30]) + self._encode_len(len(var)) + var
+
+    def _route(self, topic: str, payload: bytes, retain: bool) -> None:
+        """Store retained (if flagged) and push to every matching subscriber."""
+        self.published[topic] = payload
+        self.messages.append((topic, payload))
+        if retain:
+            if payload:
+                self.retained[topic] = payload
+            else:
+                self.retained.pop(topic, None)  # empty retained clears it
+        packet = self._publish_packet(topic, payload)
+        for filt, writer in list(self.subscriptions):
+            if self._topic_matches(filt, topic):
+                try:
+                    writer.write(packet)
+                except Exception:
+                    pass
 
     @staticmethod
     def _encode_len(n: int) -> bytes:
@@ -173,6 +237,8 @@ class FakeMqttBroker:
             multiplier *= 128
 
     async def _handle(self, reader, writer) -> None:
+        will = None
+        graceful = False
         try:
             while True:
                 header = (await reader.readexactly(1))[0]
@@ -180,9 +246,11 @@ class FakeMqttBroker:
                 remaining = await self._read_len(reader)
                 body = await reader.readexactly(remaining) if remaining else b""
                 if ptype == 0x10:        # CONNECT
+                    _, will = self._parse_connect(body)
                     writer.write(bytes([0x20, 0x02, 0x00, 0x00]))       # CONNACK
                 elif ptype == 0x30:      # PUBLISH from client
                     qos = (flags & 0x06) >> 1
+                    retain = bool(flags & 0x01)
                     tlen = int.from_bytes(body[0:2], "big")
                     topic = body[2:2 + tlen].decode()
                     rest = body[2 + tlen:]
@@ -191,28 +259,49 @@ class FakeMqttBroker:
                         writer.write(bytes([0x40, 0x02]) + pid)         # PUBACK
                     else:
                         payload = rest
-                    self.published[topic] = payload
-                    self.messages.append((topic, payload))
+                    self._route(topic, payload, retain)
                 elif ptype == 0x80:      # SUBSCRIBE
                     pid, rest, i = body[0:2], body[2:], 0
                     count = 0
+                    new_filters = []
                     while i < len(rest):
                         flen = int.from_bytes(rest[i:i + 2], "big"); i += 2
                         topic = rest[i:i + flen].decode(); i += flen
                         i += 1  # requested QoS byte
                         self.subscriptions.append((topic, writer))
+                        new_filters.append(topic)
                         count += 1
                     writer.write(bytes([0x90]) + self._encode_len(2 + count)
                                  + pid + bytes([0x00] * count))          # SUBACK
+                    # Deliver matching retained messages to the new subscriber.
+                    for filt in new_filters:
+                        for rt, rp in list(self.retained.items()):
+                            if self._topic_matches(filt, rt):
+                                writer.write(self._publish_packet(rt, rp))
+                elif ptype == 0xA0:      # UNSUBSCRIBE (flags nibble is 0x2)
+                    pid, rest, i = body[0:2], body[2:], 0
+                    while i < len(rest):
+                        flen = int.from_bytes(rest[i:i + 2], "big"); i += 2
+                        topic = rest[i:i + flen].decode(); i += flen
+                        self.subscriptions = [
+                            (t, w) for (t, w) in self.subscriptions
+                            if not (w is writer and t == topic)
+                        ]
+                    writer.write(bytes([0xB0, 0x02]) + pid)             # UNSUBACK
                 elif ptype == 0xC0:      # PINGREQ
                     writer.write(bytes([0xD0, 0x00]))                    # PINGRESP
                 elif ptype == 0xE0:      # DISCONNECT
+                    graceful = True
                     break
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
             self.subscriptions = [(t, w) for (t, w) in self.subscriptions if w is not writer]
+            # An unclean disconnect publishes the client's Last-Will.
+            if will is not None and not graceful:
+                wtopic, wpayload, wretain = will
+                self._route(wtopic, wpayload, wretain)
             writer.close()
 
     async def wait_for_subscription(self, topic: str, timeout: float = 5.0) -> bool:
@@ -674,6 +763,112 @@ switches:
         f"(admin={int(mqtt_agent_port.admin.syntax)}, "
         f"restored_delta={restored_after - restored_before})",
     )
+
+    # --- Scenario C: peer awareness + self-organising master election ---
+    # Two instances see each other over MQTT and agree, with no coordinator, on
+    # a single master (lowest priority). When the master dies the standby takes
+    # over and the surviving master reports the loss.
+    log.info("=== scenario C: cluster election + failover + peer alerts ===")
+    cluster_notifier = Notifier(cfg)  # reuse fake HA/SMTP sinks to catch alerts
+    HB, PEER_TIMEOUT = 0.4, 1.2
+
+    def make_cluster(node: str, priority: int) -> Cluster:
+        ccfg = ClusterConfig(
+            host="127.0.0.1", port=MQTT_PORT, node_id=node, priority=priority,
+            boot_id=f"{node}-boot", client_id=f"test-cluster-{node}",
+            base_topic="switch_killswitch/cluster",
+            heartbeat_interval=HB, peer_timeout=PEER_TIMEOUT, expected_nodes=2,
+        )
+        return Cluster(ccfg, cluster_notifier)
+
+    node_a = make_cluster("node-a", priority=10)
+    node_b = make_cluster("node-b", priority=20)
+    master_topic = "switch_killswitch/cluster/master"
+    sensor_disc = "homeassistant/sensor/switch_killswitch_cluster/config"
+
+    await node_a.start()
+    await asyncio.sleep(0.3)
+    await node_b.start()
+    await asyncio.sleep(HB + 0.9)  # let presence propagate + grace window elapse
+
+    check(
+        "lower-priority node elected master, the other stands by",
+        node_a.is_master and not node_b.is_master
+        and node_a.master == "node-a" and node_b.master == "node-a",
+        f"(a.master={node_a.is_master}, b.master={node_b.is_master})",
+    )
+    check(
+        "master pointer + HA status sensor published by the master",
+        broker.published.get(master_topic) == b"node-a"
+        and sensor_disc in broker.published
+        and b"Cluster master" in broker.published[sensor_disc],
+        f"(master_topic={broker.published.get(master_topic)})",
+    )
+
+    # The master dies -> the standby must take over and report the loss.
+    cluster_events_before = len(ha.events)
+    node_a.stop()
+    await asyncio.sleep(1.0)
+    check(
+        "standby is promoted to master when the master leaves",
+        node_b.is_master and node_b.master == "node-b"
+        and broker.published.get(master_topic) == b"node-b",
+        f"(b.master={node_b.is_master}, master_topic={broker.published.get(master_topic)})",
+    )
+    cluster_events = [e for _, e in ha.events[cluster_events_before:]]
+    peer_downs = [e for e in cluster_events
+                  if e.get("event") == "peer_down" and e.get("peer") == "node-a"]
+    became = [e for e in cluster_events
+              if e.get("event") == "became_master" and e.get("node") == "node-b"]
+    check(
+        "surviving master raises a peer_down alert for the lost instance",
+        len(peer_downs) >= 1 and peer_downs[-1].get("degraded") is True,
+        f"(peer_down_events={peer_downs})",
+    )
+    check(
+        "failover announces the new master (became_master alert)",
+        len(became) >= 1,
+        f"(became_master_events={became})",
+    )
+    node_b.stop()
+    await asyncio.sleep(0.2)
+
+    # --- Scenario CH: the elected master owns the HA control surface ---
+    # A clustered HAController is passive until told it is master, then it takes
+    # over the entity (subscribes to commands, asserts availability) and releases
+    # it cleanly on demotion — this is the automatic-failover handoff.
+    log.info("=== scenario CH: HA control surface follows the elected master ===")
+    ch_controller = HAController(mqtt_cfg, mqtt_actor, clustered=True)
+    await ch_controller.start()
+    await asyncio.sleep(0.4)
+    ch_entity = ch_controller._port_for("127.0.0.1", 28)
+    passive = not any(t == ch_entity.command_topic for t, _ in broker.subscriptions)
+    check(
+        "a clustered controller stays passive until it is master",
+        passive,
+        f"(subscribed_while_passive={not passive})",
+    )
+
+    ch_controller.set_master(True)
+    took_over = await broker.wait_for_subscription(ch_entity.command_topic, timeout=3)
+    await asyncio.sleep(0.2)
+    check(
+        "becoming master takes over the entity (subscribe + availability online)",
+        took_over
+        and broker.published.get("switch_killswitch/availability") == b"online",
+        f"(subscribed={took_over}, "
+        f"avail={broker.published.get('switch_killswitch/availability')})",
+    )
+
+    ch_controller.set_master(False)
+    await asyncio.sleep(0.3)
+    released = not any(t == ch_entity.command_topic for t, _ in broker.subscriptions)
+    check(
+        "losing master releases the entity (unsubscribes from commands)",
+        released,
+        f"(still_subscribed={not released})",
+    )
+    ch_controller.stop()
 
     failed = [n for n, ok in CHECKS if not ok]
     print()
