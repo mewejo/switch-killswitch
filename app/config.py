@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 import socket
+import uuid
 from dataclasses import dataclass, field
 
 import yaml
@@ -141,6 +142,38 @@ class MqttControlConfig:
 
 
 @dataclass(frozen=True)
+class ClusterConfig:
+    """Peer awareness + master election across redundant instances, over MQTT.
+
+    Optional and outbound-only, like every other MQTT use here. It never gates
+    the kill path: it only lets instances alert when a peer dies and agree on a
+    single owner for the Home Assistant control surface. Master is a pure
+    function of the live set — the live node with the lowest (priority, node_id).
+    """
+    host: str
+    port: int = 1883
+    username: str = ""
+    password: str = ""
+    tls: bool = False
+    keepalive: int = 60
+    node_id: str = ""
+    priority: int = 100
+    # Distinguishes one run of a node from the next (a reboot) — set per process.
+    boot_id: str = ""
+    client_id: str = ""
+    base_topic: str = "switch_killswitch/cluster"
+    heartbeat_interval: float = 10.0
+    peer_timeout: float = 30.0
+    # If set, "degraded" is flagged whenever fewer than this many nodes are live.
+    expected_nodes: int = 0
+    # Publish a Home Assistant status sensor (current master + online set).
+    ha_sensor: bool = True
+    discovery_prefix: str = "homeassistant"
+    device_id: str = "switch_killswitch"
+    device_name: str = "Switch Killswitch"
+
+
+@dataclass(frozen=True)
 class NotificationsConfig:
     email: EmailConfig | None = None
     home_assistant: HomeAssistantConfig | None = None
@@ -167,6 +200,8 @@ class Config:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     # Optional Home Assistant control surface over MQTT (see/toggle ports).
     mqtt_control: MqttControlConfig | None = None
+    # Optional peer awareness + master election across redundant instances.
+    cluster: ClusterConfig | None = None
 
 
 def _as_bool(value) -> bool:
@@ -251,6 +286,51 @@ def _load_mqtt_control(raw: dict) -> MqttControlConfig | None:
         retain=_as_bool(raw.get("retain", True)),
         allow_reenable=_as_bool(raw.get("allow_reenable", True)),
         allow_disable=_as_bool(raw.get("allow_disable", True)),
+    )
+
+
+def _load_cluster(raw: dict) -> ClusterConfig | None:
+    if not _as_bool(raw.get("enabled")):
+        return None
+    host = str(raw.get("host", ""))
+    if not host:
+        raise ConfigError("cluster: host is required when enabled")
+    username = str(raw.get("username", "") or "")
+    password = ""
+    if username:
+        password = (
+            _read_secret(raw, "password")
+            if (raw.get("password_file") or raw.get("password_env") or raw.get("password"))
+            else ""
+        )
+    node_id = str(raw.get("node_id") or "").strip() or socket.gethostname()
+    node_id = re.sub(r"[^A-Za-z0-9_.-]", "_", node_id)
+    client_id = str(raw.get("client_id") or "").strip() or f"switch-killswitch-cluster-{node_id}"
+    heartbeat = float(raw.get("heartbeat_interval", 10.0))
+    peer_timeout = float(raw.get("peer_timeout", 30.0))
+    if heartbeat <= 0:
+        raise ConfigError("cluster.heartbeat_interval must be > 0")
+    if peer_timeout <= heartbeat:
+        raise ConfigError("cluster.peer_timeout must be greater than heartbeat_interval")
+    return ClusterConfig(
+        host=host,
+        port=int(raw.get("port", 1883)),
+        username=username,
+        password=password,
+        tls=_as_bool(raw.get("tls")),
+        keepalive=int(raw.get("keepalive", 60)),
+        node_id=node_id,
+        priority=int(raw.get("priority", 100)),
+        boot_id=uuid.uuid4().hex[:8],
+        client_id=client_id,
+        base_topic=str(raw.get("base_topic", "switch_killswitch/cluster")).rstrip("/"),
+        heartbeat_interval=heartbeat,
+        peer_timeout=peer_timeout,
+        expected_nodes=int(raw.get("expected_nodes", 0)),
+        ha_sensor=_as_bool(raw.get("ha_sensor", True)),
+        discovery_prefix=str(raw.get("discovery_prefix", "homeassistant")).rstrip("/"),
+        device_id=str(raw.get("device_id", "switch_killswitch")),
+        device_name=str(raw.get("device_name", "Switch Killswitch")),
     )
 
 
@@ -346,6 +426,27 @@ def load_config_from_env() -> Config:
             "allow_reenable": env.get("MQTT_ALLOW_REENABLE", "true"),
             "allow_disable": env.get("MQTT_ALLOW_DISABLE", "true"),
         },
+        "cluster": {
+            "enabled": env.get("CLUSTER_ENABLED", "false"),
+            # Broker defaults to the same one the HA control surface uses, so a
+            # typical two-instance setup only sets CLUSTER_ENABLED + priority.
+            "host": env.get("CLUSTER_MQTT_HOST", env.get("MQTT_HOST", "")),
+            "port": env.get("CLUSTER_MQTT_PORT", env.get("MQTT_PORT", 1883)),
+            "username": env.get("CLUSTER_MQTT_USERNAME", env.get("MQTT_USERNAME", "")),
+            "password_env": "CLUSTER_MQTT_PASSWORD" if env.get("CLUSTER_MQTT_PASSWORD") else "MQTT_PASSWORD",
+            "tls": env.get("CLUSTER_MQTT_TLS", env.get("MQTT_TLS", "false")),
+            "node_id": env.get("CLUSTER_NODE_ID", ""),
+            "priority": env.get("CLUSTER_PRIORITY", 100),
+            "client_id": env.get("CLUSTER_CLIENT_ID", ""),
+            "base_topic": env.get("CLUSTER_BASE_TOPIC", "switch_killswitch/cluster"),
+            "heartbeat_interval": env.get("CLUSTER_HEARTBEAT", 10),
+            "peer_timeout": env.get("CLUSTER_PEER_TIMEOUT", 30),
+            "expected_nodes": env.get("CLUSTER_EXPECTED_NODES", 0),
+            "ha_sensor": env.get("CLUSTER_HA_SENSOR", "true"),
+            "discovery_prefix": env.get("MQTT_DISCOVERY_PREFIX", "homeassistant"),
+            "device_id": env.get("MQTT_DEVICE_ID", "switch_killswitch"),
+            "device_name": env.get("MQTT_DEVICE_NAME", "Switch Killswitch"),
+        },
         "switches": switches,
     }
     return _build_config(raw)
@@ -430,6 +531,7 @@ def _build_config(raw: dict) -> Config:
     )
 
     mqtt_control = _load_mqtt_control(raw.get("mqtt_control") or {})
+    cluster = _load_cluster(raw.get("cluster") or {})
 
     return Config(
         snmp=creds,
@@ -441,4 +543,5 @@ def _build_config(raw: dict) -> Config:
         rate_limit=rate_limit,
         notifications=notifications,
         mqtt_control=mqtt_control,
+        cluster=cluster,
     )

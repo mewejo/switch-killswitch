@@ -120,6 +120,41 @@ seconds on standbys, so a standby acts only when the primary failed to. Two
 instances at delay 0 still converge (the SET is idempotent); the worst case
 is a duplicate notification in the sub-second race window.
 
+### Peer awareness and master election (optional)
+
+The redundancy above is deliberately *leaderless* — and the kill path stays
+that way. But it means an instance can die and you'd never know your
+redundancy is now gone. Turn on the **cluster** surface and the instances see
+each other over MQTT and, with no coordinator, agree on a single "master":
+
+- **Dead-man's switch.** If an instance disconnects or hangs, the survivors
+  raise a `peer_down` alert through your normal channels (email / HA), and
+  `peer_up` when it returns. Set `CLUSTER_EXPECTED_NODES` and the alert also
+  says whether you've dropped below full strength (`degraded`).
+- **Automatic ownership of the HA control surface.** The [Home Assistant
+  toggle](#see-and-re-enable-ports-from-home-assistant) wants exactly one
+  publisher. Instead of hand-picking it, enable `MQTT_ENABLED` on every
+  instance and turn on the cluster — the elected master owns the entities and
+  hands them off automatically if it fails.
+- A Home Assistant **sensor** shows the current master and the live node set;
+  it expires (goes unavailable) if the whole cluster dies.
+
+Master is a pure function of who's alive — the live node with the lowest
+`(priority, node_id)` — so every instance computes the same answer with no
+votes and no split-brain to resolve. Pin a preferred master with
+`CLUSTER_PRIORITY` (lower wins; make the primary `10`, a standby `20`).
+
+Crucially, **election never gates the kill path.** Shutting a port stays
+leaderless — every instance can still kill, coordinating through the switch —
+so a master dying in the window before a new one is elected can never miss a
+cable pull. Election governs only the convenience/ownership duties above,
+where a brief disagreement costs at most a duplicate notification.
+
+Connection to the broker is outbound-only, and it defaults to the same broker
+`MQTT_*` already uses, so a two-box setup adds only `CLUSTER_ENABLED=true` and
+a distinct `CLUSTER_PRIORITY` per host. See [`.env.example`](.env.example) for
+every knob.
+
 ## Notifications
 
 Three events can fire:
@@ -131,6 +166,10 @@ Three events can fire:
 | `rate_limited` | The storm guard refused an action |
 | `port_restored` | A port was deliberately re-enabled (e.g. from Home Assistant) |
 | `port_disabled` | A port was deliberately shut on demand (not a link-loss kill) |
+| `peer_down` | A peer instance went offline — redundancy degraded (cluster mode) |
+| `peer_up` | A peer instance rejoined (cluster mode) |
+| `became_master` | This instance took over as cluster master (e.g. after a failover) |
+| `resigned_master` | This instance handed the master role to another (cluster mode) |
 
 Notification failures are logged and never block the kill path.
 

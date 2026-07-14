@@ -29,15 +29,26 @@ async def run(config_path: str | None) -> None:
     notifier = Notifier(cfg)
     actor = PortShutdownActor(cfg, notifier)
 
+    clustered = cfg.cluster is not None
     controller = None
     if cfg.mqtt_control is not None:
         from .ha_control import HAController
-        controller = HAController(cfg, actor)
+        controller = HAController(cfg, actor, clustered=clustered)
+
+    cluster = None
+    if clustered:
+        from .cluster import Cluster
+        cluster = Cluster(cfg.cluster, notifier)
+        # The elected master owns the HA control surface; hand it over on change.
+        if controller is not None:
+            cluster.on_master_change(controller.set_master)
 
     poller = LinkPoller(cfg, actor, state_sink=controller.on_port_state if controller else None)
     poller.start()
     if controller is not None:
         await controller.start()
+    if cluster is not None:
+        await cluster.start()
     log = logging.getLogger("killswitch")
     log.info(
         "notification channels: %s",
@@ -46,6 +57,10 @@ async def run(config_path: str | None) -> None:
     log.info(
         "home assistant control (mqtt): %s",
         "enabled" if controller is not None else "disabled",
+    )
+    log.info(
+        "cluster (peer awareness + master election): %s",
+        "enabled" if cluster is not None else "disabled",
     )
     for sw in cfg.switches.values():
         log.info(
@@ -56,6 +71,8 @@ async def run(config_path: str | None) -> None:
     try:
         await asyncio.Event().wait()  # run forever
     finally:
+        if cluster is not None:
+            cluster.stop()
         if controller is not None:
             controller.stop()
 

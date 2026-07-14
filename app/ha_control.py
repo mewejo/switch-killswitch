@@ -69,13 +69,19 @@ class _Port:
 class HAController:
     """Bridges watched ports to Home Assistant over MQTT."""
 
-    def __init__(self, cfg: Config, actor: PortShutdownActor) -> None:
+    def __init__(self, cfg: Config, actor: PortShutdownActor,
+                 clustered: bool = False) -> None:
         if cfg.mqtt_control is None:
             raise ValueError("HAController requires cfg.mqtt_control")
         self._cfg = cfg.mqtt_control
         self._actor = actor
         self._availability_topic = f"{self._cfg.base_topic}/availability"
         self._controllable = self._cfg.allow_reenable or self._cfg.allow_disable
+        # When part of a cluster, exactly one instance (the elected master) owns
+        # this surface at a time; we start passive and only publish/subscribe
+        # once told we are master. Standalone, we are always the owner.
+        self._clustered = clustered
+        self._master = not clustered
 
         self._ports: list[_Port] = []
         self._by_command: dict[str, _Port] = {}
@@ -108,7 +114,12 @@ class HAController:
             client.username_pw_set(self._cfg.username, self._cfg.password or None)
         if self._cfg.tls:
             client.tls_set()
-        client.will_set(self._availability_topic, AVAIL_OFFLINE, qos=1, retain=True)
+        # Standalone, our death should mark the entity unavailable, so we set a
+        # Last-Will. In a cluster we don't: availability is owned by whichever
+        # instance is master (a non-master's death must not flap the entity),
+        # and the cluster's own status sensor signals total cluster loss.
+        if not self._clustered:
+            client.will_set(self._availability_topic, AVAIL_OFFLINE, qos=1, retain=True)
         client.reconnect_delay_set(min_delay=1, max_delay=30)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
@@ -135,9 +146,15 @@ class HAController:
         if self._client is None:
             return
         try:
-            self._client.publish(self._availability_topic, AVAIL_OFFLINE, qos=1, retain=True)
-            self._client.loop_stop()
+            info = self._client.publish(self._availability_topic, AVAIL_OFFLINE,
+                                        qos=1, retain=True)
+            try:
+                info.wait_for_publish(1.0)  # flush before we cut the connection
+            except (ValueError, RuntimeError):
+                pass
+            # disconnect() before loop_stop() is paho's supported shutdown order.
             self._client.disconnect()
+            self._client.loop_stop()
         except Exception:
             pass
 
@@ -147,7 +164,30 @@ class HAController:
         if reason_code != 0:
             log.warning("MQTT connect failed: %s", reason_code)
             return
-        log.info("MQTT connected to %s:%d", self._cfg.host, self._cfg.port)
+        log.info("MQTT connected to %s:%d%s", self._cfg.host, self._cfg.port,
+                 "" if self._master else " (passive — awaiting master election)")
+        if self._master:
+            self._assert_ownership(client)
+
+    def set_master(self, is_master: bool) -> None:
+        """Called (on the event loop) when this instance's cluster master status
+        flips. The master owns the HA entities; a standby stays silent."""
+        if is_master == self._master:
+            return
+        self._master = is_master
+        client = self._client
+        log.warning("HA control surface: %s ownership (cluster master=%s)",
+                    "taking" if is_master else "releasing", is_master)
+        if client is None:
+            return
+        if is_master:
+            self._assert_ownership(client)
+        else:
+            self._relinquish_ownership(client)
+
+    def _assert_ownership(self, client: mqtt.Client) -> None:
+        """Publish availability + discovery, subscribe to commands, and arrange
+        for every port's state to be (re)published on the next poll."""
         client.publish(self._availability_topic, AVAIL_ONLINE, qos=1, retain=True)
         for port in self._ports:
             client.publish(
@@ -158,8 +198,18 @@ class HAController:
             if self._controllable:
                 client.subscribe(port.command_topic, qos=1)
         # Forget what we think HA has so the next poll re-publishes every port's
-        # state — this restores entities after a broker restart wiped retained.
+        # state — restores entities after a broker restart or a master handoff.
         self._published.clear()
+
+    def _relinquish_ownership(self, client: mqtt.Client) -> None:
+        # Stop acting on commands; leave availability alone so the new master's
+        # AVAIL_ONLINE wins without an intermediate offline flap.
+        if self._controllable:
+            for port in self._ports:
+                try:
+                    client.unsubscribe(port.command_topic)
+                except Exception:
+                    pass
 
     def _on_message(self, client, userdata, message) -> None:
         # Runs on paho's network thread — hop to the event loop to touch SNMP.
@@ -174,6 +224,8 @@ class HAController:
     # ------------------------------------------------------------------ commands
 
     def _dispatch_command(self, topic: str, payload: str) -> None:
+        if not self._master:
+            return  # a standby ignores commands; the master owns the toggle
         port = self._by_command.get(topic)
         if port is None:
             return
@@ -242,7 +294,7 @@ class HAController:
     def publish_state(self, switch: SwitchConfig, ifindex: int,
                       admin_up: bool, link_up: bool | None) -> None:
         client = self._client
-        if client is None:
+        if client is None or not self._master:
             return
         port = self._port_for(switch.ip, ifindex)
         if port is None:
